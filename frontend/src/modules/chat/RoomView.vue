@@ -893,6 +893,26 @@ async function joinRoom() {
   }
 }
 
+function linkify(text) {
+  if (!text) return ''
+  
+  // First, escape HTML to prevent XSS (important!)
+  const escaped = text
+    .replace(/&/g, '&amp;')
+    .replace(/</g, '&lt;')
+    .replace(/>/g, '&gt;')
+    .replace(/"/g, '&quot;')
+    .replace(/'/g, '&#039;')
+
+  // Regex to find URLs
+  const urlRegex = /(https?:\/\/[^\s]+)/g
+  
+  // Replace URLs with anchor tags
+  return escaped.replace(urlRegex, (url) => {
+    return `<a href="${url}" target="_blank" rel="noopener noreferrer" class="text-emerald-400 hover:text-emerald-300 underline">${url}</a>`
+  })
+}
+
 onMounted(async () => {
   isComponentMounted = true
   try {
@@ -1105,8 +1125,11 @@ onBeforeUnmount(() => {
               </div>
             </template>
             <template v-else>
-              <div :class="['px-3 py-2 rounded-2xl text-sm whitespace-pre-wrap break-words', m.sender_id === myId ? 'bg-emerald-600/20 text-emerald-100 border border-emerald-600/30 rounded-tr-sm' : 'bg-gray-800 text-gray-100 border border-gray-700 rounded-tl-sm']">{{ m.text }}</div>
-              <div class="opacity-0 group-hover:opacity-100 transition-opacity flex gap-2 text-[10px] mt-0.5">
+                <div 
+                  :class="['px-3 py-2 rounded-2xl text-sm whitespace-pre-wrap break-words', m.sender_id === myId ? 'bg-emerald-600/20 text-emerald-100 border border-emerald-600/30 rounded-tr-sm' : 'bg-gray-800 text-gray-100 border border-gray-700 rounded-tl-sm']"
+                  v-html="linkify(m.text)"
+                ></div>              
+                <div class="opacity-0 group-hover:opacity-100 transition-opacity flex gap-2 text-[10px] mt-0.5">
                 <template v-if="canEdit(m)">
                   <button @click="startEdit(m)" class="text-gray-500 hover:text-emerald-400">edit</button>
                   <button @click="deleteMessage(m)" class="text-gray-500 hover:text-red-400">delete</button>
