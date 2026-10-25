@@ -1,0 +1,59 @@
+#!/usr/bin/env perl
+use strict;
+use warnings;
+use lib 'lib';
+use Mojo::Pg;
+use Mojo::File 'path';
+
+my $env = $ENV{CIPHERBOX_ENV} // 'development';
+
+my $root      = path(__FILE__)->dirname->dirname;
+my $conf_file = $root->child('cipherbox.conf');
+
+my $config = do $conf_file->to_string;
+die "Cannot parse $conf_file: $@" if $@;
+die "Cannot read $conf_file: $!" unless defined $config;
+
+my $dsn = $env eq 'test'
+    ? $config->{test}{pg}{dsn}
+    : $config->{pg}{dsn};
+
+die "No DSN for env=$env\n" unless $dsn;
+print "Using DSN: $dsn\n";
+
+my $pg = Mojo::Pg->new($dsn);
+my $db = $pg->db;
+
+# Ensure tracking table exists
+$db->query(<<'SQL');
+CREATE TABLE IF NOT EXISTS schema_migrations (
+    filename   TEXT PRIMARY KEY,
+    applied_at TIMESTAMPTZ NOT NULL DEFAULT now()
+)
+SQL
+
+my %applied = map { $_->[0] => 1 }
+    @{ $db->query('SELECT filename FROM schema_migrations')->arrays };
+
+my @files = sort { $a->basename cmp $b->basename }
+    @{ $root->child('migrations')->list->grep(qr/\.sql$/) };
+
+my $count = 0;
+for my $file (@files) {
+    my $name = $file->basename;
+    if ($applied{$name}) {
+        print "Skipping $name (already applied)\n";
+        next;
+    }
+    print "Applying $name...\n";
+    my $sql = $file->slurp;
+    eval { $db->query($sql); 1 }
+        or die "Failed: $@";
+    $db->query('INSERT INTO schema_migrations (filename) VALUES (?)', $name);
+    print "  OK\n";
+    $count++;
+}
+
+print $count
+    ? "$count migration(s) applied to $env database.\n"
+    : "Nothing to apply; $env database is up to date.\n";

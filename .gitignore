@@ -1,0 +1,105 @@
+# --- Carton / Perl Dependencies ---
+/local/
+/.build/
+cpanfile.snapshot.bak
+
+# --- Perl Build Artifacts ---
+/Makefile
+/Makefile.old
+/blib/
+/_build/
+/pm_to_blib
+*.bs
+*.o
+*.so
+*.a
+*.c
+*.h
+*.xs
+*.tar.gz
+*.tar.bz2
+*.zip
+META.json
+META.yml
+MYMETA.json
+MYMETA.yml
+
+# --- Test Output & Cache ---
+*.tap
+t/var/
+/tmp/
+.prove
+.cover_db/
+nytprof.out
+
+# --- Application Runtime & Logs ---
+*.log
+*.pid
+/cipherbox.pid
+/hypnotoad.pid
+/run/
+.env
+
+# --- Secure Storage (Files encrypted at rest) ---
+# Never commit user uploads or encrypted paste blobs
+/storage/library/*.bin
+/storage/pastes/*.bin
+/storage/tmp/
+
+# --- Database ---
+# (Assuming local dumps or temporary data)
+*.sqlite
+*.db
+dump.sql
+
+# --- Frontend (Vue / Vite / Node) ---
+/frontend/node_modules/
+/frontend/dist/
+/frontend/.vite/
+/frontend/.cache/
+/frontend/npm-debug.log*
+/frontend/yarn-debug.log*
+/frontend/yarn-error.log*
+/frontend/pnpm-debug.log*
+
+# --- IDE / Editors ---
+# VS Code
+.vscode/
+*.code-workspace
+
+# JetBrains (IntelliJ, PhpStorm, WebStorm, etc.)
+.idea/
+*.iml
+*.ipr
+*.iws
+
+# Vim / Neovim
+*.swp
+*.swo
+*.swn
+*~
+.viminfo
+
+# Emacs
+*~
+\#*\#
+.\#*
+
+# Sublime Text
+*.sublime-project
+*.sublime-workspace
+
+# macOS / OSX
+.DS_Store
+.AppleDouble
+.LSOverride
+
+# Windows
+Thumbs.db
+ehthumbs.db
+Desktop.ini
+$RECYCLE.BIN/
+
+# Linux
+*~
+.directory

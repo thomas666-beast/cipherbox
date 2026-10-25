@@ -1,0 +1,18 @@
+<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 80 80" fill="none">
+  <!-- Solid emerald background with rounded corners -->
+  <rect width="80" height="80" rx="16" fill="#10b981"/>
+  
+  <!-- Dark hexagon shield -->
+  <path d="M40 14 L64 28 L64 52 L40 66 L16 52 L16 28 Z" 
+        stroke="#030712" stroke-width="3" stroke-linejoin="round" fill="none"/>
+        
+  <!-- Broken vertex crack -->
+  <path d="M40 14 L34 22 L40 24 L46 22 Z" fill="#10b981"/>
+  
+  <!-- Dark > prompt -->
+  <path d="M30 34 L40 40 L30 46" 
+        stroke="#030712" stroke-width="3" stroke-linecap="round" stroke-linejoin="round" fill="none"/>
+        
+  <!-- Dark _ cursor -->
+  <rect x="44" y="44" width="10" height="3" fill="#030712"/>
+</svg>

@@ -1,0 +1,26 @@
+{
+  hypnotoad => {
+    listen  => ['http://127.0.0.1:3000'],
+    workers => 1,
+  },
+  secrets => ['REPLACE-WITH-A-LONG-RANDOM-STRING-MIN-32-CHARS'],
+  master_key => 'REPLACE-WITH-ANOTHER-LONG-RANDOM-STRING',
+  pagination => {
+    default_limit => 100,
+    max_limit     => 200,
+  },
+  pg => {
+    dsn => 'postgresql://cipherbox:cipherbox@127.0.0.1/cipherbox',
+  },
+  test => {
+    secrets => ['test-jwt-secret-32chars-minimum!!'],
+    master_key => 'test-master-key-32chars-minimum!!',
+    pagination => {
+      default_limit => 100,
+      max_limit     => 200,
+    },
+    pg => {
+      dsn => 'postgresql://cipherbox:cipherbox@127.0.0.1/cipherbox_test',
+    },
+  },
+}
