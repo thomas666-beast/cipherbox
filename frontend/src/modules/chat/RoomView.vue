@@ -110,7 +110,15 @@ const isReadOnly = computed(() => {
   const r = room.value
   if (!r) return false
   if (r.type !== 'channel') return false
-  return r.my_role !== 'owner' && r.my_role !== 'admin'
+  
+  // If the current user is the owner (by ID), they can ALWAYS write
+  if (myId.value && r.owner_id === myId.value) return false
+  
+  // Admins can write
+  if (r.my_role === 'admin') return false
+  
+  // Everyone else is read-only
+  return true
 })
 
 const typingLabel = computed(() => {
