@@ -62,6 +62,24 @@ dump.sql
 /frontend/yarn-error.log*
 /frontend/pnpm-debug.log*
 
+# --- Rust / Crypto Engines ---
+# Ignore compiled binaries and WASM output
+/target/
+**/target/
+**/Cargo.lock
+**/pkg/
+*.wasm
+*.rlib
+*.rmeta
+*.d
+# Keep source files, but ignore local build outputs
+/crypto/client-wasm/target/
+/crypto/server-native/target/
+/frontend/src/pqc/*.wasm
+/frontend/src/pqc/*.js
+/bin/cipherbox-pqc-verify
+/bin/cipherbox-pqc-wrap
+
 # --- IDE / Editors ---
 # VS Code
 .vscode/
