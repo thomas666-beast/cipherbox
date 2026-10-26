@@ -4,7 +4,6 @@ use warnings;
 use lib 'lib';
 use Mojo::Pg;
 use Mojo::File 'path';
-use Cipherbox::Model::User;
 
 my $root      = path(__FILE__)->dirname->dirname;
 my $conf_file = $root->child('cipherbox.conf');
@@ -16,23 +15,24 @@ my $dsn = $env eq 'test'
     ? $config->{test}{pg}{dsn}
     : $config->{pg}{dsn};
 
-my ($username, $password) = @ARGV;
-die "Usage: $0 <username> <password>\n"
-    unless $username and $password;
+my ($username) = @ARGV;
+die "Usage: $0 <username>\n" unless $username;
 
 my $pg = Mojo::Pg->new($dsn);
-my $users = Cipherbox::Model::User->new(pg => $pg);
+my $db = $pg->db;
 
-my $existing = $users->find_by_username($username);
+my $existing = $db->query('SELECT id FROM users WHERE username = ?', $username)->hash;
+
 if ($existing) {
-    if (($existing->{role} // '') eq 'admin') {
-        print "User '$username' already exists and is admin.\n";
-        exit 0;
-    }
-    $pg->db->query("UPDATE users SET role = 'admin' WHERE id = ?", $existing->{id});
+    $db->query("UPDATE users SET role = 'admin' WHERE id = ?", $existing->{id});
     print "User '$username' promoted to admin.\n";
-    exit 0;
+} else {
+    # Create the user with a dummy password hash (since they will use PQC)
+    $db->query(
+        "INSERT INTO users (username, password_hash, role) VALUES (?, 'PQC-ONLY', 'admin')",
+        $username
+    );
+    print "Admin '$username' created.\n";
 }
 
-my $user = $users->create($username, $password, 'admin');
-print "Admin '$username' created (id=$user->{id}).\n";
+1;

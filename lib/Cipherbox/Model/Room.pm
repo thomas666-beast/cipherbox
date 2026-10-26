@@ -8,25 +8,28 @@ sub _new_hash ($self) {
     return unpack('H*', random_bytes(10));
 }
 
-sub create ($self, $name, $type, $owner_id, $room_key_encrypted, $is_invite_only = 0) {
+sub create ($self, $name, $type, $owner_id, $is_invite_only = 0, $room_key_encrypted = undef, $is_ephemeral = 0) {
     my $db = $self->pg->db;
     my $tx = $db->begin;
-
     my $hash = $self->_new_hash;
 
     my $room = $db->query(
-        'INSERT INTO rooms (name, type, owner_id, room_key_encrypted, public_hash, is_invite_only)
-         VALUES (?, ?, ?, ?, ?, ?) RETURNING *',
-        $name, $type, $owner_id, $room_key_encrypted, $hash, $is_invite_only ? 1 : 0,
+        'INSERT INTO rooms (name, type, owner_id, public_hash, is_invite_only, room_key_encrypted, is_ephemeral)
+         VALUES (?, ?, ?, ?, ?, ?, ?) RETURNING *',
+        $name, $type, $owner_id, $hash, $is_invite_only ? 1 : 0, $room_key_encrypted, $is_ephemeral ? 1 : 0,
     )->hash;
-
-    $db->query(
-        'INSERT INTO room_members (room_id, user_id, role) VALUES (?, ?, ?)',
-        $room->{id}, $owner_id, 'owner',
-    );
 
     $tx->commit;
     return $room;
+}
+
+sub add_member ($self, $room_id, $user_id, $role = 'member', $kyber_ciphertext = undef) {
+    $self->pg->db->query(
+        'INSERT INTO room_members (room_id, user_id, role, kyber_ciphertext)
+         VALUES (?, ?, ?, ?)
+         ON CONFLICT (room_id, user_id) DO UPDATE SET kyber_ciphertext = EXCLUDED.kyber_ciphertext',
+        $room_id, $user_id, $role, $kyber_ciphertext,
+    );
 }
 
 sub find_by_id ($self, $id) {
@@ -61,14 +64,6 @@ sub find_private_room ($self, $user_a_id, $user_b_id) {
         },
         $user_a_id, $user_b_id,
     )->hash;
-}
-
-sub add_member ($self, $room_id, $user_id, $role = 'member') {
-    $self->pg->db->query(
-        'INSERT INTO room_members (room_id, user_id, role) VALUES (?, ?, ?)
-         ON CONFLICT (room_id, user_id) DO NOTHING',
-        $room_id, $user_id, $role,
-    );
 }
 
 sub remove_member ($self, $room_id, $user_id) {
@@ -133,6 +128,7 @@ sub count_members ($self, $room_id, $q = undef) {
             $room_id, $like,
         )->array->[0];
     }
+    
     return $self->pg->db->query(
         'SELECT count(*) FROM room_members WHERE room_id = ?', $room_id
     )->array->[0];
@@ -181,10 +177,12 @@ sub list_messages ($self, $room_id, $before = undef, $limit = undef, $max_limit 
     my ($sql, @bind);
     if ($before) {
         $sql = q{
-            SELECT m.id, m.sender_id, m.content_encrypted, m.content_iv, m.content_tag,
+            SELECT m.id, m.sender_id, u.username AS sender_username,
+                   m.content_encrypted, m.content_iv, m.content_tag,
                    m.created_at, m.deleted_at, m.deleted_by,
                    (SELECT count(*) FROM message_edits me WHERE me.message_id = m.id) AS edit_count
             FROM messages m
+            JOIN users u ON u.id = m.sender_id
             WHERE m.room_id = ? AND m.id < ?
             ORDER BY m.id DESC
             LIMIT ?
@@ -192,10 +190,12 @@ sub list_messages ($self, $room_id, $before = undef, $limit = undef, $max_limit 
         @bind = ($room_id, $before, $limit);
     } else {
         $sql = q{
-            SELECT m.id, m.sender_id, m.content_encrypted, m.content_iv, m.content_tag,
+            SELECT m.id, m.sender_id, u.username AS sender_username,
+                   m.content_encrypted, m.content_iv, m.content_tag,
                    m.created_at, m.deleted_at, m.deleted_by,
                    (SELECT count(*) FROM message_edits me WHERE me.message_id = m.id) AS edit_count
             FROM messages m
+            JOIN users u ON u.id = m.sender_id
             WHERE m.room_id = ?
             ORDER BY m.id DESC
             LIMIT ?

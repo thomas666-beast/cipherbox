@@ -54,8 +54,28 @@ export class ChatSocket {
     this.ws.onmessage = (evt) => {
       let msg
       try { msg = JSON.parse(evt.data) } catch (e) { return }
-      const list = this.handlers.get(msg.type) || []
+      
+      // Map numeric types to string event names
+      const typeMap = {
+        0: 'chat.send',
+        1: 'chat.recv',
+        2: 'chat.typing',
+        3: 'chat.join',
+        4: 'chat.leave',
+        5: 'chat.deleted',
+        6: 'chat.edited',
+        7: 'room.updated',
+        8: 'room.deleted',
+        9: 'error',
+        10: 'announcement.pending',
+        11: 'announcement.published',
+      }
+      
+      const eventName = typeMap[msg.t] || msg.type || 'unknown'
+      
+      const list = this.handlers.get(eventName) || []
       for (const h of list.slice()) h(msg)
+      
       const any = this.handlers.get('*') || []
       for (const h of any.slice()) h(msg)
     }
@@ -90,14 +110,12 @@ export class ChatSocket {
       this.ws.send(encoded)
       return true
     }
-    
-    // If not connected, queue it
     this.outQueue.push(encoded)
     return false
   }
 
   joinRoom(roomId) {
-    this.pendingJoin = { type: 'chat.join', room_id: roomId }
+    this.pendingJoin = { t: 3, r: roomId }  // new format
     if (this.ws && this.ws.readyState === WebSocket.OPEN) {
       this.ws.send(JSON.stringify(this.pendingJoin))
     }

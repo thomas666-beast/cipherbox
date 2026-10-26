@@ -41,7 +41,8 @@ sub search ($self, $query, $limit = 50) {
     return [] unless defined $query and length $query;
     my $like = "%$query%";
     return $self->pg->db->query(
-        'SELECT id, username, role FROM users
+        'SELECT id, username, role, kyber_public_key 
+         FROM users
          WHERE username ILIKE ?
          ORDER BY username
          LIMIT ?',
@@ -79,6 +80,15 @@ sub update_role ($self, $user_id, $role) {
         $role, $user_id,
     );
     return 1;
+}
+
+sub create_pqc ($self, $username, $dsa_key, $kem_key, $role = 'user') {
+    my $row = $self->pg->db->query(
+        'INSERT INTO users (username, password_hash, dilithium_public_key, kyber_public_key, role)
+         VALUES (?, ?, ?, ?, ?) RETURNING id, username, role',
+        $username, 'PQC-ONLY', $dsa_key, $kem_key, $role,
+    )->hash;
+    return $row;
 }
 
 1;

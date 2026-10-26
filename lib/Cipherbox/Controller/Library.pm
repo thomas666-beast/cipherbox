@@ -1,10 +1,10 @@
 package Cipherbox::Controller::Library;
 use Mojo::Base 'Mojolicious::Controller', -signatures;
 use Mojo::File 'path';
-use Encode qw(encode);
 use UUID::Tiny qw(create_uuid_as_string UUID_V4);
 use Crypt::AuthEnc::GCM;
 use MIME::Base64 ();
+use Crypt::PRNG qw(random_bytes);
 
 sub _storage_dir ($self) {
     my $dir = path($self->app->home, 'storage', 'library');
@@ -25,7 +25,9 @@ sub _resolve_item ($self, $param) {
     return $self->library->find_item_by_hash_or_id($param);
 }
 
-# --- Categories ---
+# ==========================================
+# CATEGORIES
+# ==========================================
 
 sub list_categories ($self) {
     my $parent = $self->param('parent_id');
@@ -123,7 +125,14 @@ sub delete_category ($self) {
     $self->render(json => { ok => 1, deleted_categories => scalar(@cat_ids) });
 }
 
-# --- Items ---
+sub tree ($self) {
+    my $tree = $self->library->tree;
+    $self->render(json => { tree => $tree });
+}
+
+# ==========================================
+# ITEMS (FILES)
+# ==========================================
 
 sub list_items ($self) {
     my $param = $self->param('id');
@@ -165,22 +174,43 @@ sub upload_item ($self) {
     return $self->render(json => { error => 'category not found' }, status => 404)
         unless $cat;
 
-    my $plaintext = $file->slurp;
-    $plaintext = encode('UTF-8', $plaintext) if utf8::is_utf8($plaintext);
+    my $max_size   = $self->config->{storage}{max_upload_size} // 104857600;
+    my $chunk_size = $self->config->{storage}{chunk_size}      // 65536;
+
+    my $size = $file->size // 0;
+    return $self->render(json => { error => "file too large (max " . ($max_size / 1024 / 1024) . " MB)" }, status => 400)
+        if $size > $max_size;
 
     my $uuid     = create_uuid_as_string(UUID_V4);
     my $file_key = $self->crypto->generate_room_key;
     my $wrapped  = $self->crypto->wrap_room_key($file_key);
 
-    my $enc = $self->crypto->encrypt_bytes($file_key, $plaintext);
-
-    my $payload = $enc->{iv} . $enc->{tag} . $enc->{data};
-    $payload = encode('UTF-8', $payload) if utf8::is_utf8($payload);
-
+    my $raw_key  = MIME::Base64::decode_base64($file_key);
+    my $iv       = random_bytes(12);
+    
     my $stored_path = $self->_storage_dir->child("$uuid.bin");
-    $stored_path->spew($payload);
 
-    my $mime = $file->headers->content_type // 'application/octet-stream';
+    # Use Mojo::Asset->path to get the temporary file path
+    my $temp_path = $file->asset->path;
+    CORE::open(my $fh_in, '<:raw', $temp_path) or die "Cannot open temp file: $!";
+    CORE::open(my $fh_out, '>:raw', $stored_path) or die "Cannot open dest file: $!";
+    
+    print $fh_out $iv;
+    my $ae = Crypt::AuthEnc::GCM->new('AES', $raw_key, $iv);
+    
+    my $buf;
+    while (read($fh_in, $buf, $chunk_size)) {
+        my $ct = $ae->encrypt_add($buf);
+        print $fh_out $ct;
+    }
+    my $tag = $ae->encrypt_done;
+    print $fh_out $tag;
+    
+    close $fh_in;
+    close $fh_out;
+
+    my $mime  = $file->headers->content_type // 'application/octet-stream';
+    my $fname = $file->filename // 'file';
 
     my $item = eval {
         $self->library->create_item(
@@ -190,7 +220,7 @@ sub upload_item ($self) {
             file_key_encrypted => $wrapped,
             mime_type          => $mime,
             uploaded_by        => $self->current_user->{id},
-            file_size          => length $plaintext,
+            file_size          => $size,
             uuid               => $uuid,
         );
     };
@@ -220,63 +250,47 @@ sub download_item ($self) {
     return $self->render(json => { error => 'file missing' }, status => 500)
         unless -e $stored_path;
 
+    my $chunk_size = $self->config->{storage}{chunk_size} // 65536;
+
     my $file_key = $self->crypto->unwrap_room_key($item->{file_key_encrypted});
     my $raw_key  = MIME::Base64::decode_base64($file_key);
 
-    open my $fh1, '<:raw', $stored_path->to_string or
+    CORE::open(my $fh, '<:raw', $stored_path) or
         return $self->render(json => { error => 'open failed' }, status => 500);
-
-    my ($iv, $tag, $ct_off, $ct_len) = $self->crypto->read_enc_header($fh1);
-    close $fh1;
-
-    my $verify_ok = eval {
-        open my $fhv, '<:raw', $stored_path->to_string or die "open: $!";
-        seek($fhv, $ct_off, 0) or die "seek: $!";
-        my $ae = Crypt::AuthEnc::GCM->new('AES', $raw_key, $iv);
-        my $buf;
-        my $remaining = $ct_len;
-        while ($remaining > 0) {
-            my $want = $remaining > 65536 ? 65536 : $remaining;
-            my $got  = read($fhv, $buf, $want);
-            die "short read" unless defined $got and $got > 0;
-            $ae->decrypt_add($buf);
-            $remaining -= $got;
-        }
-        $ae->decrypt_done($tag);
-        close $fhv;
-        1;
-    };
-    unless ($verify_ok) {
-        return $self->render(json => { error => 'decrypt failed', detail => "$@" }, status => 500);
-    }
-
-    open my $fh2, '<:raw', $stored_path->to_string or
-        return $self->render(json => { error => 'open failed' }, status => 500);
-    seek($fh2, $ct_off, 0) or do {
-        close $fh2;
-        return $self->render(json => { error => 'seek failed' }, status => 500);
-    };
+    
+    my $iv;
+    read($fh, $iv, 12);
+    
+    my $file_size = -s $stored_path;
+    my $ct_len = $file_size - 12 - 16;
+    
+    my $tag;
+    seek($fh, -16, 2);
+    read($fh, $tag, 16);
+    
+    seek($fh, 12, 0);
 
     $self->res->headers->content_type($item->{mime_type} // 'application/octet-stream');
     my $safe_title = $item->{title};
     $safe_title =~ s/"/\\"/g;
     $self->res->headers->content_disposition('attachment; filename="' . $safe_title . '"');
-    $self->res->headers->content_length($ct_len);
-    $self->res->code(200);
-
+    
     my $ae = Crypt::AuthEnc::GCM->new('AES', $raw_key, $iv);
     $self->res->body('');
     my $remaining = $ct_len;
     my $buf;
+    
     while ($remaining > 0) {
-        my $want = $remaining > 65536 ? 65536 : $remaining;
-        my $got  = read($fh2, $buf, $want);
+        my $want = $remaining > $chunk_size ? $chunk_size : $remaining;
+        my $got  = read($fh, $buf, $want);
         last unless $got;
         my $pt = $ae->decrypt_add($buf);
         $self->write($pt);
         $remaining -= $got;
     }
-    close $fh2;
+    
+    $ae->decrypt_done($tag);
+    close $fh;
     $self->finish;
 }
 
@@ -312,11 +326,6 @@ sub rename_item ($self) {
 
     $self->library->update_item_title($item->{id}, $title);
     $self->render(json => { ok => 1, title => $title });
-}
-
-sub tree ($self) {
-    my $tree = $self->library->tree;
-    $self->render(json => { tree => $tree });
 }
 
 1;

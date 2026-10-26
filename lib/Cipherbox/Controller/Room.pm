@@ -5,6 +5,23 @@ sub _resolve_room ($self, $param) {
     return $self->rooms->find_by_hash_or_id($param);
 }
 
+sub _check_ephemeral_destruction ($self, $room) {
+    return unless $room->{is_ephemeral};
+    
+    my $remaining = $self->pg->db->query(
+        'SELECT count(*) FROM room_members WHERE room_id = ?', $room->{id}
+    )->array->[0];
+    
+    if ($remaining == 0) {
+        # Destroy the room and all its data
+        $self->rooms->delete($room->{id});
+        
+        Cipherbox::Controller::Chat::broadcast_room(
+            $self, $room->{id}, { type => 'room.deleted', room_id => $room->{id} }
+        );
+    }
+}
+
 sub list ($self) {
     my $user  = $self->current_user;
     my $rooms = $self->rooms->list_for_user($user->{id});
@@ -17,43 +34,50 @@ sub create ($self) {
     my $name = $body->{name} // '';
     my $type = $body->{type} // 'room';
     my $member_id = $body->{member_id};
+    my $owner_ciphertext = $body->{owner_kyber_ciphertext}; 
+    my $plaintext_key = $body->{plaintext_room_key};
     my $is_invite_only = $body->{is_invite_only} ? 1 : 0;
+    my $is_ephemeral = $body->{is_ephemeral} ? 1 : 0; # <-- NEW
 
     return $self->render(json => { error => 'missing name' }, status => 400)
         unless length $name;
-    return $self->render(json => { error => 'bad type' }, status => 400)
-        unless $type =~ /^(private|channel|room)$/;
 
-    if ($type eq 'private') {
-        return $self->render(json => { error => 'member_id required for private' }, status => 400)
-            unless $member_id;
-        return $self->render(json => { error => 'user not found' }, status => 404)
-            unless $self->users->find_by_id($member_id);
-        return $self->render(json => { error => 'cannot invite yourself' }, status => 400)
-            if $member_id == $user->{id};
-        $is_invite_only = 1;
+    my $room_key_encrypted = undef;
 
-        my $existing = $self->rooms->find_private_room($user->{id}, $member_id);
-        if ($existing) {
-            return $self->render(json => { room => $existing, reused => 1 });
+    if ($is_invite_only) {
+        return $self->render(json => { error => 'missing ciphertext' }, status => 400)
+            unless $owner_ciphertext;
+        
+        if ($type eq 'private') {
+            return $self->render(json => { error => 'member_id required for private' }, status => 400)
+                unless $member_id;
+            return $self->render(json => { error => 'user not found' }, status => 404)
+                unless $self->users->find_by_id($member_id);
+            return $self->render(json => { error => 'cannot invite yourself' }, status => 400)
+                if $member_id == $user->{id};
+
+            my $existing = $self->rooms->find_private_room($user->{id}, $member_id);
+            if ($existing) {
+                return $self->render(json => { room => $existing, reused => 1 });
+            }
         }
+    } else {
+        return $self->render(json => { error => 'missing plaintext_room_key' }, status => 400)
+            unless $plaintext_key;
+        $room_key_encrypted = $self->crypto->wrap_room_key($plaintext_key);
     }
 
-    my $room_key = $self->crypto->generate_room_key;
-    my $wrapped  = $self->crypto->wrap_room_key($room_key);
+    my $room = $self->rooms->create($name, $type, $user->{id}, $is_invite_only, $room_key_encrypted, $is_ephemeral);
+    $self->rooms->add_member($room->{id}, $user->{id}, 'owner', $owner_ciphertext);
 
-    my $room = $self->rooms->create($name, $type, $user->{id}, $wrapped, $is_invite_only);
-
-    if ($type eq 'private') {
-        $self->rooms->add_member($room->{id}, $member_id, 'member');
+    if ($type eq 'private' and $member_id) {
+        my $member_ciphertext = $body->{member_kyber_ciphertext};
+        $self->rooms->add_member($room->{id}, $member_id, 'member', $member_ciphertext);
     }
 
     Cipherbox::Controller::Chat::notify_room_members(
         $self, $room->{id}, { type => 'room.created', room_id => $room->{id} }
     );
-    Cipherbox::Controller::Chat::notify_user(
-        $self, $member_id, { type => 'room.created', room_id => $room->{id} }
-    ) if $member_id;
 
     $self->render(json => { room => $room });
 }
@@ -76,7 +100,30 @@ sub join ($self) {
     return $self->render(json => { ok => 1, already_member => 1 })
         if $self->rooms->is_member($room->{id}, $user->{id});
 
-    $self->rooms->add_member($room->{id}, $user->{id}, 'member');
+    # For public rooms/channels, server wraps the key automatically
+    my $kyber_ciphertext = undef;
+    if ($room->{room_key_encrypted}) {
+        my $user_row = $self->pg->db->query(
+            'SELECT kyber_public_key FROM users WHERE id = ?', $user->{id}
+        )->hash;
+
+        if ($user_row && $user_row->{kyber_public_key}) {
+            my $room_key = $self->crypto->unwrap_room_key($room->{room_key_encrypted});
+            my $wrap_bin = $self->app->home->child('bin', 'cipherbox-pqc-wrap')->to_string;
+            
+            my $cmd = join(' ', map { my $s = $_; $s =~ s/'/'\\''/g; "'$s'" }
+                ($wrap_bin, $user_row->{kyber_public_key}, $room_key));
+            
+            my $out = qx{$cmd 2>/dev/null};
+            my $exit = $? >> 8;
+            if ($exit == 0 && $out =~ /^\{.*\}$/) {
+                chomp $out;
+                $kyber_ciphertext = $out;
+            }
+        }
+    }
+
+    $self->rooms->add_member($room->{id}, $user->{id}, 'member', $kyber_ciphertext);
 
     Cipherbox::Controller::Chat::notify_room_members(
         $self, $room->{id}, { type => 'room.updated', room_id => $room->{id} }
@@ -91,12 +138,26 @@ sub key ($self) {
     my $room = $self->_resolve_room($param);
     return $self->render(json => { error => 'room not found' }, status => 404)
         unless $room;
+
+    # If it's NOT invite-only (Public), return the plaintext key
+    if (!$room->{is_invite_only}) {
+        return $self->render(json => { error => 'server key missing from DB' }, status => 500)
+            unless $room->{room_key_encrypted};
+
+        my $room_key = $self->crypto->unwrap_room_key($room->{room_key_encrypted});
+        return $self->render(json => { plaintext_room_key => $room_key });
+    }
+
+    # If it IS invite-only (Private), return the Kyber ciphertext
+    my $member = $self->pg->db->query(
+        'SELECT kyber_ciphertext FROM room_members WHERE room_id = ? AND user_id = ?',
+        $room->{id}, $user->{id}
+    )->hash;
+
     return $self->render(json => { error => 'forbidden' }, status => 403)
-        unless $self->rooms->is_member($room->{id}, $user->{id});
-    return $self->render(json => { error => 'banned' }, status => 403)
-        if $self->rooms->is_banned($room->{id}, $user->{id});
-    my $room_key = $self->crypto->unwrap_room_key($room->{room_key_encrypted});
-    $self->render(json => { room_key => $room_key });
+        unless $member;
+
+    $self->render(json => { kyber_ciphertext => $member->{kyber_ciphertext} });
 }
 
 sub invite ($self) {
@@ -104,6 +165,7 @@ sub invite ($self) {
     my $param   = $self->param('id');
     my $body    = $self->req->json;
     my $target  = $body->{user_id};
+    my $target_ciphertext = $body->{target_kyber_ciphertext};
 
     my $room = $self->_resolve_room($param);
     return $self->render(json => { error => 'room not found' }, status => 404)
@@ -116,18 +178,10 @@ sub invite ($self) {
     return $self->render(json => { error => 'user not found' }, status => 404)
         unless $self->users->find_by_id($target);
 
-    return $self->render(json => { error => 'user is banned, unban first' }, status => 400)
-        if $self->rooms->is_banned($room->{id}, $target);
+    return $self->render(json => { error => 'missing ciphertext' }, status => 400)
+        unless $target_ciphertext;
 
-    if ($room->{type} eq 'private') {
-        my $count = $self->pg->db->query(
-            'SELECT count(*) FROM room_members WHERE room_id = ?', $room->{id}
-        )->array->[0];
-        return $self->render(json => { error => 'private room is full' }, status => 400)
-            if $count >= 2;
-    }
-
-    $self->rooms->add_member($room->{id}, $target, 'member');
+    $self->rooms->add_member($room->{id}, $target, 'member', $target_ciphertext);
 
     Cipherbox::Controller::Chat::notify_room_members(
         $self, $room->{id}, { type => 'room.updated', room_id => $room->{id} }
@@ -149,8 +203,9 @@ sub remove ($self) {
     return $self->render(json => { error => 'room not found' }, status => 404)
         unless $room;
 
+    my $role = $self->rooms->member_role($room->{id}, $user->{id});
     return $self->render(json => { error => 'forbidden' }, status => 403)
-        unless $room->{owner_id} == $user->{id};
+        unless $role and $role =~ /^(owner|admin)$/;
 
     return $self->render(json => { error => 'cannot remove owner' }, status => 400)
         if $target == $room->{owner_id};
@@ -161,41 +216,14 @@ sub remove ($self) {
     Cipherbox::Controller::Chat::notify_room_members(
         $self, $room->{id}, { type => 'room.updated', room_id => $room->{id} }
     );
+
     Cipherbox::Controller::Chat::notify_user(
         $self, $target, { type => 'room.removed', room_id => $room->{id} }
     );
 
+    $self->_check_ephemeral_destruction($room); # <-- NEW
+
     $self->render(json => { ok => 1 });
-}
-
-sub unban ($self) {
-    my $user    = $self->current_user;
-    my $param   = $self->param('id');
-    my $target  = $self->param('user_id');
-
-    my $room = $self->_resolve_room($param);
-    return $self->render(json => { error => 'room not found' }, status => 404)
-        unless $room;
-
-    return $self->render(json => { error => 'forbidden' }, status => 403)
-        unless $room->{owner_id} == $user->{id};
-
-    $self->rooms->unban_user($room->{id}, $target);
-    $self->render(json => { ok => 1 });
-}
-
-sub bans ($self) {
-    my $user    = $self->current_user;
-    my $param   = $self->param('id');
-
-    my $room = $self->_resolve_room($param);
-    return $self->render(json => { error => 'room not found' }, status => 404)
-        unless $room;
-    return $self->render(json => { error => 'forbidden' }, status => 403)
-        unless $room->{owner_id} == $user->{id};
-
-    my $bans = $self->rooms->list_bans($room->{id});
-    $self->render(json => { bans => $bans });
 }
 
 sub leave ($self) {
@@ -209,14 +237,51 @@ sub leave ($self) {
     my $role = $self->rooms->member_role($room->{id}, $user->{id});
     return $self->render(json => { error => 'not a member' }, status => 403)
         unless $role;
-    return $self->render(json => { error => 'owner cannot leave, delete instead' }, status => 400)
-        if $role eq 'owner';
 
+    my $member_count = $self->pg->db->query(
+        'SELECT count(*) FROM room_members WHERE room_id = ?', $room->{id}
+    )->array->[0];
+
+    if ($role eq 'owner') {
+        if ($room->{is_ephemeral}) {
+            if ($member_count == 1) {
+                # Owner is the last one — destroy the room
+                $self->rooms->delete($room->{id});
+                Cipherbox::Controller::Chat::broadcast_room(
+                    $self, $room->{id}, { type => 'room.deleted', room_id => $room->{id} }
+                );
+                return $self->render(json => { ok => 1, destroyed => 1 });
+            } else {
+                return $self->render(
+                    json => { error => 'you must wait for all members to leave first' },
+                    status => 400,
+                );
+            }
+        } else {
+            return $self->render(json => { error => 'owner cannot leave, delete instead' }, status => 400);
+        }
+    }
+
+    # Regular member leaving
     $self->rooms->remove_member($room->{id}, $user->{id});
 
     Cipherbox::Controller::Chat::notify_room_members(
         $self, $room->{id}, { type => 'room.updated', room_id => $room->{id} }
     );
+
+    # Ephemeral room: destroy if empty
+    if ($room->{is_ephemeral}) {
+        my $remaining = $self->pg->db->query(
+            'SELECT count(*) FROM room_members WHERE room_id = ?', $room->{id}
+        )->array->[0];
+        
+        if ($remaining == 0) {
+            $self->rooms->delete($room->{id});
+            Cipherbox::Controller::Chat::broadcast_room(
+                $self, $room->{id}, { type => 'room.deleted', room_id => $room->{id} }
+            );
+        }
+    }
 
     $self->render(json => { ok => 1 });
 }
@@ -231,11 +296,12 @@ sub delete ($self) {
     return $self->render(json => { error => 'forbidden' }, status => 403)
         unless $room->{owner_id} == $user->{id};
 
-    Cipherbox::Controller::Chat::notify_room_members(
+    # Notify everyone currently in the room
+    Cipherbox::Controller::Chat::broadcast_room(
         $self, $room->{id}, { type => 'room.deleted', room_id => $room->{id} }
     );
-    $self->rooms->delete($room->{id});
 
+    $self->rooms->delete($room->{id});
     $self->render(json => { ok => 1 });
 }
 
@@ -265,14 +331,15 @@ sub messages ($self) {
         messages => [
             map {
                 {
-                    id         => $_->{id},
-                    sender_id  => $_->{sender_id},
-                    ct         => $_->{content_encrypted},
-                    iv         => $_->{content_iv},
-                    tag        => $_->{content_tag},
-                    ts         => "$_->{created_at}",
-                    edit_count => $_->{edit_count} + 0,
-                    deleted_at => $_->{deleted_at} ? "$_->{deleted_at}" : undef,
+                    id              => $_->{id},
+                    sender_id       => $_->{sender_id},
+                    sender_username => $_->{sender_username},
+                    ct              => $_->{content_encrypted},
+                    iv              => $_->{content_iv},
+                    tag             => $_->{content_tag},
+                    ts              => "$_->{created_at}",
+                    edit_count      => $_->{edit_count} + 0,
+                    deleted_at      => $_->{deleted_at} ? "$_->{deleted_at}" : undef,
                 }
             } @ordered
         ],
@@ -287,23 +354,20 @@ sub members ($self) {
         unless $room;
     return $self->render(json => { error => 'forbidden' }, status => 403)
         unless $self->rooms->is_member($room->{id}, $user->{id});
-
-    my $limit  = $self->param('limit') // 100;
+    
+    my $limit  = $self->param('limit') // 50;
     my $offset = $self->param('offset') // 0;
     my $q      = $self->param('q');
-
-    $limit = 200 if $limit > 200;
-    $limit = 1 if $limit < 1;
-    $offset = 0 if $offset < 0;
+    $limit = 100 if $limit > 100;
 
     my $members = $self->rooms->list_members($room->{id}, $limit, $offset, $q);
     my $total   = $self->rooms->count_members($room->{id}, $q);
 
-    $self->render(json => {
+    $self->render(json => { 
         members => $members,
-        total   => $total,
-        limit   => $limit,
-        offset  => $offset,
+        total => $total,
+        limit => $limit,
+        offset => $offset
     });
 }
 
@@ -331,19 +395,6 @@ sub delete_message ($self) {
     return $self->render(json => { error => 'forbidden' }, status => 403)
         unless $is_sender || $is_manager;
 
-    # Delete any attached paste blob before soft-deleting the message
-    my $paste = $self->pg->db->query(
-        'SELECT * FROM pastes WHERE message_id = ? AND deleted_at IS NULL',
-        $message_id,
-    )->hash;
-    if ($paste) {
-        if ($paste->{kind} eq 'file' && $paste->{file_path}) {
-            my $stored = path($self->app->home, 'storage', 'pastes', $paste->{file_path});
-            $stored->remove if -e $stored;
-        }
-        $self->pastes->mark_deleted($paste->{id});
-    }
-
     $self->rooms->soft_delete_message($message_id, $user->{id});
 
     Cipherbox::Controller::Chat::broadcast_room(
@@ -353,16 +404,6 @@ sub delete_message ($self) {
             message_id => $message_id,
         },
     );
-
-    if ($paste) {
-        Cipherbox::Controller::Chat::notify_room_members(
-            $self, $room->{id}, {
-                type       => 'paste.deleted',
-                room_id    => $room->{id},
-                paste_hash => $paste->{public_hash},
-            },
-        );
-    }
 
     $self->render(json => { ok => 1 });
 }
@@ -406,12 +447,18 @@ sub edit_message ($self) {
 
     $self->rooms->update_message($message_id, $ct, $iv, $tag);
 
+    # Get the new edit count
+    my $edit_count = $self->message_edits->count_for_message($message_id);
+
     Cipherbox::Controller::Chat::broadcast_room(
         $self, $room->{id}, {
             type       => 'chat.edited',
             room_id    => $room->{id},
             message_id => $message_id,
-            ct         => $ct, iv => $iv, tag => $tag,
+            ct         => $ct, 
+            iv         => $iv, 
+            tag        => $tag,
+            edit_count => $edit_count, # <-- Send the new count
         },
     );
 
@@ -458,6 +505,13 @@ sub find_by_id_public ($self) {
     my $user = $self->current_user;
     my $is_member = $user ? $self->rooms->is_member($room->{id}, $user->{id}) : 0;
     my $banned    = $user ? $self->rooms->is_banned($room->{id}, $user->{id}) : 0;
+    
+    my $member_count = $self->pg->db->query(
+        'SELECT count(*) FROM room_members WHERE room_id = ?', $room->{id}
+    )->array->[0];
+
+    my $my_role = $is_member ? $self->rooms->member_role($room->{id}, $user->{id}) : undef;
+    my $is_public = $room->{is_invite_only} ? 0 : 1;
 
     $self->render(json => {
         room => {
@@ -467,9 +521,13 @@ sub find_by_id_public ($self) {
             type           => $room->{type},
             owner_id       => $room->{owner_id},
             is_invite_only => $room->{is_invite_only} ? 1 : 0,
+            is_public      => $is_public,
             is_member      => $is_member ? 1 : 0,
+            my_role        => $my_role,
+            member_count   => $member_count + 0,
             joinable       => ($room->{type} ne 'private' && !$room->{is_invite_only} && !$banned) ? 1 : 0,
             banned         => $banned ? 1 : 0,
+            is_ephemeral   => $room->{is_ephemeral} ? 1 : 0,
         },
     });
 }

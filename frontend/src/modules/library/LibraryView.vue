@@ -69,7 +69,7 @@ export default {
 </script>
 
 <script setup>
-import { ref, onMounted, computed } from 'vue'
+import { ref, onMounted, computed, watch } from 'vue'
 import { useRoute, useRouter } from 'vue-router'
 import api from '../../core/api'
 import { useAuthStore } from '../../core/auth'
@@ -86,7 +86,6 @@ const treeLoading = ref(true)
 const treeError = ref('')
 const expandedNodes = ref({})
 
-// Read the hash directly from the URL on mount
 const selectedHash = ref(route.params.hash || null)
 
 const category = ref(null)
@@ -104,6 +103,7 @@ const uploadTitle = ref('')
 const uploadFile = ref(null)
 const uploadMessage = ref('')
 const uploading = ref(false)
+const uploadProgress = ref(0)
 
 const editingItemId = ref(null)
 const editingTitle = ref('')
@@ -186,7 +186,6 @@ function toggleNode(node) {
   expandedNodes.value[node.public_hash] = !expandedNodes.value[node.public_hash]
 }
 
-// Just push the URL. App.vue will destroy and recreate this component.
 function selectCategory(hash) {
   router.push(hash ? `/library/category/${hash}` : '/library')
 }
@@ -196,16 +195,18 @@ async function createCategory() {
   if (!newName.value.trim()) return
   creating.value = true
   try {
-    const res = await api.post('/library/categories', {
+    await api.post('/library/categories', {
       name: newName.value.trim(),
       type: newType.value,
       parent_id: selectedHash.value || undefined,
     })
-    const newHash = res.data.category.public_hash
     newName.value = ''
-
-    // Instead of reloading content, just navigate to the new category
-    selectCategory(newHash)
+    
+    // Refresh tree and content
+    await loadTree()
+    if (selectedHash.value) {
+      await loadContent()
+    }
   } catch (e) {
     createError.value = e.response?.data?.error || 'Failed to create category'
   } finally {
@@ -213,26 +214,35 @@ async function createCategory() {
   }
 }
 
-function onFileChange(e) {
-  uploadFile.value = e.target.files[0] || null
-}
-
 async function upload() {
   uploadMessage.value = ''
   if (!uploadTitle.value.trim() || !uploadFile.value || !selectedHash.value) return
   uploading.value = true
+  uploadProgress.value = 0
+  
   try {
     const form = new FormData()
     form.append('title', uploadTitle.value.trim())
     form.append('category_id', selectedHash.value)
     form.append('file', uploadFile.value)
-    await api.post('/library/items', form)
+
+    await api.post('/library/items', form, {
+      onUploadProgress: (e) => {
+        uploadProgress.value = Math.round((e.loaded * 100) / e.total)
+      }
+    })
+    
     uploadMessage.value = 'uploaded'
     uploadTitle.value = ''
     uploadFile.value = null
+    uploadProgress.value = 0
+    
     const fileInput = document.getElementById('upload-file')
     if (fileInput) fileInput.value = ''
+    
+    await loadTree()
     await loadContent()
+    
   } catch (e) {
     uploadMessage.value = e.response?.data?.error || 'Upload failed'
   } finally {
@@ -331,13 +341,43 @@ function sizeLabel(bytes) {
   return `${(bytes / 1024 / 1024 / 1024).toFixed(2)} GB`
 }
 
+// THE FIX: Watch for route changes and reload the UI
+watch(() => route.params.hash, async (newHash) => {
+  selectedHash.value = newHash || null
+  if (selectedHash.value) {
+    expandAncestorsOf(selectedHash.value)
+  }
+  await loadContent()
+})
+
+const maxUploadSize = ref(100 * 1024 * 1024) // default 100MB
+
 onMounted(async () => {
+  try {
+    const res = await api.get('/config')
+    if (res.data.max_upload_size) {
+      maxUploadSize.value = res.data.max_upload_size
+    }
+  } catch (e) {}
+  
   await loadTree()
   if (selectedHash.value) {
     expandAncestorsOf(selectedHash.value)
   }
   await loadContent()
 })
+
+function onFileChange(e) {
+  const f = e.target.files[0]
+  if (f && f.size > maxUploadSize.value) {
+    uploadMessage.value = `File too large. Max ${Math.round(maxUploadSize.value / 1024 / 1024)}MB.`
+    uploadFile.value = null
+    e.target.value = ''
+    return
+  }
+  uploadFile.value = f || null
+  uploadMessage.value = ''
+}
 </script>
 
 <template>
@@ -454,6 +494,9 @@ onMounted(async () => {
                   <button type="submit" :disabled="uploading" class="bg-cyan-600 hover:bg-cyan-500 text-gray-950 font-bold px-4 py-2 rounded-md text-sm transition-colors disabled:bg-gray-700 disabled:text-gray-500 flex-shrink-0">
                     {{ uploading ? '...' : '↑' }}
                   </button>
+                </div>
+                <div v-if="uploadProgress > 0 && uploadProgress < 100" class="w-full bg-gray-800 rounded-full h-2 mt-2">
+                  <div class="bg-cyan-500 h-2 rounded-full transition-all" :style="{ width: uploadProgress + '%' }"></div>
                 </div>
                 <p v-if="uploadMessage" class="text-xs text-emerald-400">{{ uploadMessage }}</p>
               </div>

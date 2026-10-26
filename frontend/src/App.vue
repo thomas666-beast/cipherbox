@@ -12,14 +12,17 @@ const route = useRoute()
 const sidebarOpen = ref(true)
 const mobileMenuOpen = ref(false)
 
+const publicRoutes = ['/login', '/register', '/pqc-login']
+const isPublicPage = computed(() => publicRoutes.includes(route.path))
+
 const isAuthenticated = computed(() => auth.authenticated)
 
 const navItems = computed(() => {
   if (!isAuthenticated.value) return []
   const items = [
     { to: '/rooms', label: 'rooms', icon: '>_' },
-    { to: '/discover', label: 'discover', icon: '~?' },
     { to: '/library', label: 'library', icon: '[]' },
+    { to: '/identity', label: 'pqc identity', icon: '#' },
   ]
   if (auth.isAdmin) {
     items.push({ to: '/admin', label: 'admin', icon: '**' })
@@ -29,7 +32,6 @@ const navItems = computed(() => {
 
 function isActive(path) {
   if (path === '/rooms') return route.path.startsWith('/rooms') && !route.path.startsWith('/rooms/')
-  if (path === '/discover') return route.path === '/discover'
   if (path === '/library') return route.path.startsWith('/library')
   return route.path === path
 }
@@ -63,7 +65,8 @@ watch(isAuthenticated, (v) => {
 
 <template>
   <div class="flex h-screen bg-gray-950 text-gray-200 font-sans">
-    <template v-if="!isAuthenticated">
+    <!-- Public Layout -->
+    <template v-if="isPublicPage">
       <div class="relative flex-1 flex items-center justify-center p-6 bg-gray-950 overflow-hidden">
         <div class="absolute inset-0 opacity-[0.07]" aria-hidden="true">
           <div class="absolute inset-0" style="background-image:
@@ -81,13 +84,15 @@ watch(isAuthenticated, (v) => {
           </div>
           <router-view />
           <p class="text-center text-xs text-gray-600 mt-8 font-mono">
-            // AES-256-GCM · JWT · WebSocket
+            // PQC · AES-256-GCM · WebSocket
           </p>
         </div>
       </div>
     </template>
 
+    <!-- Authenticated Layout -->
     <template v-else>
+      <!-- Mobile top bar -->
       <div class="lg:hidden fixed top-0 left-0 right-0 h-14 bg-gray-900 border-b border-gray-800 flex items-center justify-between px-4 z-30">
         <button @click="mobileMenuOpen = true" class="p-2 -ml-2 text-gray-400 hover:text-white" aria-label="Open menu">
           <svg class="w-6 h-6" fill="none" stroke="currentColor" viewBox="0 0 24 24">
@@ -100,6 +105,7 @@ watch(isAuthenticated, (v) => {
         <button @click="logout" class="text-xs font-mono text-gray-500 hover:text-emerald-400">exit</button>
       </div>
 
+      <!-- Sidebar -->
       <aside
         :class="[
           'fixed inset-y-0 left-0 z-40 bg-gray-900 border-r border-gray-800 transition-transform duration-200 flex flex-col',
@@ -159,11 +165,7 @@ watch(isAuthenticated, (v) => {
         </button>
       </aside>
 
-      <div
-        v-if="mobileMenuOpen"
-        @click="closeMobile"
-        class="fixed inset-0 bg-black/60 z-30 lg:hidden"
-      ></div>
+      <div v-if="mobileMenuOpen" @click="closeMobile" class="fixed inset-0 bg-black/60 z-30 lg:hidden"></div>
 
       <main
         :class="[
@@ -171,9 +173,10 @@ watch(isAuthenticated, (v) => {
           sidebarOpen ? 'lg:ml-64' : 'lg:ml-16',
         ]"
       >
-        <div class="flex-1 overflow-y-auto">
-          <div class="max-w-6xl mx-auto px-4 sm:px-6 py-6">
-            <router-view :key="$route.fullPath" />
+        <div class="flex-1 overflow-y-auto w-full">
+          <!-- Removed max-w-6xl and mx-auto to make it 100% wide -->
+          <div class="w-full px-4 sm:px-6 py-6">
+            <router-view />
           </div>
         </div>
       </main>

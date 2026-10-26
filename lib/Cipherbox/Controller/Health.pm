@@ -11,4 +11,14 @@ sub check ($self) {
     }
 }
 
+sub get_config ($self) {
+    my $storage = $self->app->config->{storage} // {};
+    
+    $self->render(json => {
+        max_upload_size => $storage->{max_upload_size} // 104857600,
+        max_paste_size  => $storage->{max_paste_size}  // 10485760,
+        chunk_size      => $storage->{chunk_size}      // 65536,
+    });
+}
+
 1;

@@ -4,7 +4,9 @@ import { useRoute, useRouter } from 'vue-router'
 import { useAuthStore } from '../../core/auth'
 import api from '../../core/api'
 import { getSocket } from '../../core/socket'
-import { encryptMessage, decryptMessage } from '../../core/crypto'
+import { encryptMessage, decryptMessage, decryptBytes, generateAesKey } from '../../core/crypto'
+import init, { MlKemKeyPair, decrypt_private_key } from '../../pqc/cipherbox_pqc.js'
+import { loadIdentity } from '../../core/pqc-db.js'
 import LoadingSpinner from '../../components/LoadingSpinner.vue'
 import ErrorBanner from '../../components/ErrorBanner.vue'
 
@@ -18,83 +20,75 @@ const input = ref('')
 const error = ref('')
 const logEl = ref(null)
 const room = ref(null)
-const members = ref([])
+const memberCount = ref(0)
 const loadingOlder = ref(false)
 const hasMore = ref(true)
 const initialLoading = ref(true)
 const sending = ref(false)
 const typingUsers = ref({})
-const needsJoin = ref(false)
-const joining = ref(false)
-const showMembers = ref(false)
-const showInvite = ref(false)
-const showBans = ref(false)
-const showSearch = ref(false)
+const needsInvite = ref(false)
+const needsUnlock = ref(false)
+const keyMissing = ref(false)
 
+const passphrase = ref('')
+const unlocking = ref(false)
+const roomAesKey = ref(null)
+
+const showSearch = ref(false)
 const searchQuery = ref('')
 const searchResults = ref([])
 const searchError = ref('')
 const searching = ref(false)
 const searchDone = ref(false)
 
+const showInvite = ref(false)
 const inviteQuery = ref('')
 const inviteResults = ref([])
 const inviteError = ref('')
 const inviteMessage = ref('')
 
-const banQuery = ref('')
-const banResults = ref([])
-const banError = ref('')
-const banLoading = ref(false)
+const showManage = ref(false)
+const manageQuery = ref('')
+const manageResults = ref([])
+const manageSearching = ref(false)
+const manageError = ref('')
+const manageLoading = ref(false)
 
-const bannedUsers = ref([])
-
-const membersFilter = ref('')
-const filteredMembers = computed(() => {
-  const q = membersFilter.value.trim().toLowerCase()
-  if (!q) return members.value
-  return members.value.filter(m => m.username.toLowerCase().includes(q))
-})
-
-const editingId = ref(null)
+// Message Edit/Delete State
+const editingMessageId = ref(null)
 const editingText = ref('')
+const hoveredMessageId = ref(null)
 
-// Paste state
-const pastesByHash = ref({})
+// Paste State
 const showPasteModal = ref(false)
-const pasteMode = ref('text')
 const pasteTitle = ref('')
 const pasteText = ref('')
+const pasteMode = ref('text')
 const pasteFile = ref(null)
 const pasteSubmitting = ref(false)
-const pasteError = ref('')
 const pasteProgress = ref(0)
+const pasteError = ref('')
+const maxPasteSize = ref(10 * 1024 * 1024)
+const openingPaste = ref(null)
 
+// Open Paste State
 const showOpenPasteModal = ref(false)
-const openPasteContent = ref('')
 const openPasteTitle = ref('')
+const openPasteContent = ref('')
 const openPasteKind = ref('text')
-const openPasteHash = ref(null)
+const openPasteHash = ref('')
 const openPasteFileName = ref('')
-const openPastePeek = ref(false)
-
 const downloading = ref(null)
 const downloadProgress = ref(0)
 
-// Report state
-const reportedIds = ref({})
-const showReportModal = ref(false)
-const reportMessage = ref(null)
-const reportReason = ref('')
-const reportSubmitting = ref(false)
-const reportError = ref('')
+const userNames = ref({})
 
 let socket = null
-let roomKey = null
 let lastTypingSent = 0
 let typingCleanupTimer = null
 let unsubs = []
 let highlightTimer = null
+let manageDebounce = null
 let isComponentMounted = false
 const isConnected = ref(false)
 const isSocketConnected = ref(true)
@@ -103,21 +97,17 @@ const myId = ref(null)
 
 const canManage = computed(() => {
   const r = room.value
-  return r && (r.my_role === 'owner' || r.my_role === 'admin')
+  if (!r) return false
+  if (myId.value && r.owner_id === myId.value) return true
+  return r.my_role === 'owner' || r.my_role === 'admin'
 })
-const isOwner = computed(() => room.value && room.value.owner_id === myId.value)
+
 const isReadOnly = computed(() => {
   const r = room.value
   if (!r) return false
   if (r.type !== 'channel') return false
-  
-  // If the current user is the owner (by ID), they can ALWAYS write
   if (myId.value && r.owner_id === myId.value) return false
-  
-  // Admins can write
   if (r.my_role === 'admin') return false
-  
-  // Everyone else is read-only
   return true
 })
 
@@ -130,14 +120,18 @@ const typingLabel = computed(() => {
   return `${names.length} people are typing...`
 })
 
+function rememberName(id, username) {
+  if (!id || !username) return
+  if (userNames.value[id] === username) return
+  userNames.value = { ...userNames.value, [id]: username }
+}
+
 function nameOf(id) {
-  const m = members.value.find(x => x.user_id === id)
-  return m ? m.username : `user#${id}`
+  return userNames.value[id] || `user#${id}`
 }
 
 function initials(id) {
-  const n = nameOf(id)
-  return n.slice(0, 2).toUpperCase()
+  return nameOf(id).slice(0, 2).toUpperCase()
 }
 
 function formatTs(ts) {
@@ -161,104 +155,96 @@ function scrollToBottom() {
 async function loadMe() {
   const res = await api.get('/me')
   myId.value = res.data.id
+  rememberName(res.data.id, res.data.username)
+}
+
+async function loadNames() {
+  try {
+    const res = await api.get(`/rooms/${roomHash}/members`, { params: { limit: 1000 } })
+    const map = { ...userNames.value }
+    for (const m of res.data.members) {
+      map[m.user_id] = m.username
+    }
+    userNames.value = map
+  } catch (e) {
+    console.error('Failed to load usernames', e)
+  }
 }
 
 async function loadRoom() {
   const meta = await api.get(`/rooms/${roomHash}`)
   room.value = meta.data.room
+  memberCount.value = meta.data.room.member_count ?? 0
+  
+  if (meta.data.room.member_count === undefined) {
+    try {
+      const countRes = await api.get(`/rooms/${roomHash}/members`, { params: { limit: 1 } })
+      memberCount.value = countRes.data.total
+    } catch (e) {}
+  }
+
   if (meta.data.room.banned) {
     error.value = 'You are banned from this room.'
     return false
   }
   if (!meta.data.room.is_member) {
-    if (meta.data.room.joinable) {
-      needsJoin.value = true
-      return false
-    }
-    error.value = 'You are not a member of this room.'
+    needsInvite.value = true
     return false
   }
   return true
 }
 
-async function loadKey() {
-  const res = await api.get(`/rooms/${roomHash}/key`)
-  roomKey = res.data.room_key
-}
-
-async function loadMembers() {
-  const res = await api.get(`/rooms/${roomHash}/members`)
-  members.value = res.data.members
-}
-
-async function loadBans() {
-  try {
-    const res = await api.get(`/rooms/${roomHash}/bans`)
-    bannedUsers.value = res.data.bans
-  } catch (e) {}
-}
-
 async function decryptOne(m) {
-  if (m.deleted_at) {
-    return { text: null, deleted: true }
-  }
+  if (m.deleted_at) return { text: null, deleted: true }
   try {
-    const text = await decryptMessage(roomKey, m.ct, m.iv, m.tag)
+    const text = await decryptMessage(roomAesKey.value, m.ct, m.iv, m.tag)
     let payload
     try { payload = JSON.parse(text) } catch (e) { payload = null }
-    if (payload && payload._type === 'paste') {
-      return { isPaste: true, paste: payload }
-    }
+    if (payload && payload._type === 'paste') return { isPaste: true, paste: payload }
     return { text }
   } catch (e) {
-    return { text: '[decrypt failed]' }
+    return { error: true, text: '[decrypt failed]' }
   }
 }
 
 async function loadInitialHistory() {
   const res = await api.get(`/rooms/${roomHash}/messages`)
   const out = []
+  
   for (const m of res.data.messages) {
-    const d = await decryptOne(m)
-    if (d.isPaste) {
-      out.push({ id: m.id, sender_id: m.sender_id, isPaste: true, paste: d.paste, ts: m.ts, edit_count: m.edit_count, deleted_at: m.deleted_at })
-    } else {
-      out.push({ id: m.id, sender_id: m.sender_id, text: d.text, ts: m.ts, edit_count: m.edit_count, deleted_at: m.deleted_at })
-    }
+    if (m.sender_username) rememberName(m.sender_id, m.sender_username)
+    out.push({
+      id: m.id,
+      sender_id: m.sender_id,
+      text: 'decrypting...',
+      ts: m.ts,
+      edit_count: m.edit_count || 0,
+      deleted_at: m.deleted_at,
+      loading: true
+    })
   }
+  
   messages.value = out
   hasMore.value = out.length >= 100
+  scrollToBottom()
 
-  for (const m of out) {
-    if (m.isPaste) {
-      try {
-        const res = await api.get(`/pastes/${m.paste.paste_hash}`)
-        const p = res.data.paste
-        pastesByHash.value[m.paste.paste_hash] = {
-          title: p.title,
-          kind: p.kind,
-          file_name: p.file_name,
-          opened_username: p.opened_username,
-          deleted_at: p.deleted_at,
-          is_sender: p.is_sender,
-          can_open: p.can_open,
-          can_done: p.can_done,
-          can_download: p.can_download,
-        }
-      } catch (e) {
-        pastesByHash.value[m.paste.paste_hash] = {
-          title: m.paste.title,
-          kind: m.paste.kind,
-          opened_username: null,
-          deleted_at: null,
-          is_sender: false,
-          can_open: true,
-          can_done: false,
-          can_download: false,
-        }
-      }
+  for (let i = 0; i < out.length; i++) {
+    const m = res.data.messages[i]
+    const d = await decryptOne(m)
+    
+    if (d.isPaste) {
+      messages.value[i].isPaste = true
+      messages.value[i].paste = d.paste
+    } else if (d.error) {
+      messages.value[i].text = d.text
+      messages.value[i].decryptError = true
+    } else {
+      messages.value[i].text = d.text
     }
+    messages.value[i].loading = false
   }
+  
+  scrollToBottom()
 }
 
 async function loadOlder() {
@@ -268,20 +254,42 @@ async function loadOlder() {
     const oldestId = messages.value[0].id
     const res = await api.get(`/rooms/${roomHash}/messages`, { params: { before: oldestId } })
     const older = []
+    
     for (const m of res.data.messages) {
-      const d = await decryptOne(m)
-      if (d.isPaste) {
-        older.push({ id: m.id, sender_id: m.sender_id, isPaste: true, paste: d.paste, ts: m.ts, edit_count: m.edit_count, deleted_at: m.deleted_at })
-      } else {
-        older.push({ id: m.id, sender_id: m.sender_id, text: d.text, ts: m.ts, edit_count: m.edit_count, deleted_at: m.deleted_at })
-      }
+      if (m.sender_username) rememberName(m.sender_id, m.sender_username)
+      older.push({
+        id: m.id,
+        sender_id: m.sender_id,
+        text: 'decrypting...',
+        ts: m.ts,
+        edit_count: m.edit_count || 0,
+        deleted_at: m.deleted_at,
+        loading: true
+      })
     }
+    
     if (older.length < 100) hasMore.value = false
     const el = logEl.value
     const prevHeight = el ? el.scrollHeight : 0
     messages.value = [...older, ...messages.value]
     await nextTick()
     if (el) el.scrollTop = el.scrollHeight - prevHeight
+
+    for (let i = 0; i < older.length; i++) {
+      const m = res.data.messages[i]
+      const d = await decryptOne(m)
+      
+      if (d.isPaste) {
+        messages.value[i].isPaste = true
+        messages.value[i].paste = d.paste
+      } else if (d.error) {
+        messages.value[i].text = d.text
+        messages.value[i].decryptError = true
+      } else {
+        messages.value[i].text = d.text
+      }
+      messages.value[i].loading = false
+    }
   } catch (e) {
     error.value = e.response?.data?.error || 'Failed to load older messages'
   } finally {
@@ -307,122 +315,188 @@ function cleanupTyping() {
   typingUsers.value = next
 }
 
+async function unlockRoom() {
+  if (!passphrase.value && !room.value.is_public) return
+
+  unlocking.value = true
+  error.value = ''
+  keyMissing.value = false
+  try {
+    await init()
+    const res = await api.get(`/rooms/${roomHash}/key`)
+    
+    if (room.value.is_public && res.data.plaintext_room_key) {
+      roomAesKey.value = res.data.plaintext_room_key
+      needsUnlock.value = false
+      
+      await loadInitialHistory()
+      await markRead()
+      await connect()
+      scrollToBottom()
+      typingCleanupTimer = setInterval(cleanupTyping, 2000)
+      return
+    }
+
+    if (!res.data.kyber_ciphertext) {
+      keyMissing.value = true
+      throw new Error('No key envelope for you in this room yet.')
+    }
+    const payload = JSON.parse(res.data.kyber_ciphertext)
+
+    const stored = await loadIdentity('pqc_identity')
+    if (!stored) throw new Error('No identity found.')
+
+    const dk_bytes = decrypt_private_key(stored.encrypted_kem_dk, passphrase.value)
+    if (dk_bytes.length === 0) throw new Error('Wrong passphrase.')
+
+    let ek_b64 = ''
+    for (let i = 0; i < stored.kem_public_key.byteLength; i++) ek_b64 += String.fromCharCode(stored.kem_public_key[i])
+    ek_b64 = btoa(ek_b64)
+
+    const kem = MlKemKeyPair.importKeys(dk_bytes, Uint8Array.from(atob(ek_b64), c => c.charCodeAt(0)))
+    let decrypted
+    try {
+      const ct = Uint8Array.from(atob(payload.ct), c => c.charCodeAt(0))
+      const ss = new Uint8Array(kem.decapsulate(ct))
+      const sharedKey = await crypto.subtle.importKey('raw', ss, { name: 'AES-GCM' }, false, ['decrypt'])
+      const iv = Uint8Array.from(atob(payload.iv), c => c.charCodeAt(0))
+      const encAes = Uint8Array.from(atob(payload.enc_aes), c => c.charCodeAt(0))
+      decrypted = await crypto.subtle.decrypt({ name: 'AES-GCM', iv }, sharedKey, encAes)
+    } finally {
+      if (kem && kem.free) kem.free()
+    }
+
+    roomAesKey.value = new TextDecoder().decode(decrypted)
+    needsUnlock.value = false
+
+    await loadInitialHistory()
+    await markRead()
+    await connect()
+    scrollToBottom()
+    typingCleanupTimer = setInterval(cleanupTyping, 2000)
+
+  } catch (e) {
+    error.value = e.message || 'Failed to unlock room'
+  } finally {
+    unlocking.value = false
+  }
+}
+
 async function connect() {
   if (isConnected.value) return
   isConnected.value = true
-
   socket = await getSocket()
-  if (!isComponentMounted) {
-    isConnected.value = false
-    return
-  }
+  if (!isComponentMounted) { isConnected.value = false; return }
 
   unsubs.push(socket.on('open', () => {
     isSocketConnected.value = true
-    socket.joinRoom(room.value.id)
+    if (room.value) socket.joinRoom(room.value.id)
   }))
 
-  unsubs.push(socket.on('close', () => {
-    isSocketConnected.value = false
-  }))
+  unsubs.push(socket.on('close', () => { isSocketConnected.value = false }))
 
   unsubs.push(socket.on('chat.recv', async (msg) => {
-    if (msg.room_id !== room.value.id) return
-    // GUARD: prevent duplicates
-    if (messages.value.some(m => m.id === msg.message_id)) return
-
-    const text = await decryptMessage(roomKey, msg.ct, msg.iv, msg.tag).catch(() => null)
-    let payload = null
-    try { payload = text ? JSON.parse(text) : null } catch (e) {}
-    if (payload && payload._type === 'paste') {
-      if (!pastesByHash.value[payload.paste_hash]) {
-        try {
-          const res = await api.get(`/pastes/${payload.paste_hash}`)
-          const p = res.data.paste
-          pastesByHash.value[payload.paste_hash] = {
-            title: p.title,
-            kind: p.kind,
-            file_name: p.file_name,
-            opened_username: p.opened_username,
-            deleted_at: p.deleted_at,
-            is_sender: p.is_sender,
-            can_open: p.can_open,
-            can_done: p.can_done,
-            can_download: p.can_download,
-          }
-        } catch (e) {
-          pastesByHash.value[payload.paste_hash] = {
-            title: payload.title,
-            kind: payload.kind,
-            opened_username: null,
-            deleted_at: null,
-            is_sender: false,
-            can_open: true,
-            can_done: false,
-            can_download: false,
-          }
+    if (!room.value || msg.r !== room.value.id) return
+    
+    rememberName(msg.u, msg.sender_username)
+    
+    // Decrypt the message
+    const text = await decryptMessage(roomAesKey.value, msg.c, msg.i, msg.g).catch(() => null)
+    
+    // 1. Check if this is OUR OWN message coming back (optimistic update)
+    const tempIdx = messages.value.findIndex(m => 
+      typeof m.id === 'string' && 
+      m.id.startsWith('temp-') && 
+      m.sender_id === msg.u && 
+      m.text === text
+    )
+    
+    if (tempIdx !== -1) {
+      // Replace the temp message with the real server ID
+      let entry
+      if (text === null) {
+        entry = { id: msg.m, sender_id: msg.u, text: '[decrypt failed]', decryptError: true, ts: msg.s, edit_count: 0, deleted_at: null }
+      } else {
+        let payload = null
+        try { payload = JSON.parse(text) } catch (e) {}
+        if (payload && payload._type === 'paste') {
+          entry = { id: msg.m, sender_id: msg.u, isPaste: true, paste: payload, ts: msg.s, edit_count: 0, deleted_at: null }
+        } else {
+          entry = { id: msg.m, sender_id: msg.u, text, ts: msg.s, edit_count: 0, deleted_at: null }
         }
       }
-      messages.value.push({ id: msg.message_id, sender_id: msg.sender_id, isPaste: true, paste: payload, ts: msg.ts, edit_count: 0, deleted_at: null })
-    } else {
-      messages.value.push({ id: msg.message_id, sender_id: msg.sender_id, text: text || '[decrypt failed]', ts: msg.ts, edit_count: 0, deleted_at: null })
+      messages.value.splice(tempIdx, 1, entry)
+      delete typingUsers.value[msg.u]
+      return
     }
-    delete typingUsers.value[msg.sender_id]
+    
+    // 2. Otherwise, it's a new message from someone else
+    if (messages.value.some(m => m.id === msg.m)) return
+    
+    let entry
+    if (text === null) {
+      entry = { id: msg.m, sender_id: msg.u, text: '[decrypt failed]', decryptError: true, ts: msg.s, edit_count: 0, deleted_at: null }
+    } else {
+      let payload = null
+      try { payload = JSON.parse(text) } catch (e) {}
+      if (payload && payload._type === 'paste') {
+        entry = { id: msg.m, sender_id: msg.u, isPaste: true, paste: payload, ts: msg.s, edit_count: 0, deleted_at: null }
+      } else {
+        entry = { id: msg.m, sender_id: msg.u, text, ts: msg.s, edit_count: 0, deleted_at: null }
+      }
+    }
+    
+    messages.value.push(entry)
+    delete typingUsers.value[msg.u]
     await nextTick()
     if (logEl.value) logEl.value.scrollTop = logEl.value.scrollHeight
     markRead()
   }))
 
   unsubs.push(socket.on('chat.deleted', (msg) => {
-    if (msg.room_id !== room.value.id) return
-    const idx = messages.value.findIndex((m) => m.id === msg.message_id)
+    if (!room.value || msg.r !== room.value.id) return
+    const idx = messages.value.findIndex((m) => m.id === msg.m)
     if (idx !== -1) {
-      messages.value[idx].deleted_at = new Date().toISOString()
+      const updatedMsg = Object.assign({}, messages.value[idx], { deleted_at: new Date().toISOString() })
+      messages.value.splice(idx, 1, updatedMsg)
     }
   }))
 
   unsubs.push(socket.on('chat.edited', async (msg) => {
-    if (msg.room_id !== room.value.id) return
-    const text = await decryptMessage(roomKey, msg.ct, msg.iv, msg.tag).catch(() => '[decrypt failed]')
-    const idx = messages.value.findIndex((m) => m.id === msg.message_id)
+    if (!room.value || msg.r !== room.value.id) return
+    
+    // Decrypt the new text
+    const text = await decryptMessage(roomAesKey.value, msg.c, msg.i, msg.g).catch(() => '[decrypt failed]')
+    
+    const idx = messages.value.findIndex((m) => m.id === msg.m)
     if (idx !== -1 && !messages.value[idx].isPaste) {
-      messages.value[idx].text = text
-      messages.value[idx].edit_count = (messages.value[idx].edit_count || 0) + 1
+      // Use splice to force Vue reactivity
+      const updatedMsg = Object.assign({}, messages.value[idx], {
+        text: text,
+        edit_count: msg.edit_count || (messages.value[idx].edit_count + 1)
+      })
+      messages.value.splice(idx, 1, updatedMsg)
     }
-    const sidx = searchResults.value.findIndex((m) => m.id === msg.message_id)
-    if (sidx !== -1 && !searchResults.value[sidx].isPaste) searchResults.value[sidx].text = text
   }))
 
   unsubs.push(socket.on('chat.typing', (msg) => {
-    if (msg.room_id !== room.value.id) return
-    if (msg.sender_id === myId.value) return
-    typingUsers.value = { ...typingUsers.value, [msg.sender_id]: Date.now() }
+    if (!room.value || msg.r !== room.value.id) return
+    if (msg.u === myId.value) return
+    typingUsers.value = { ...typingUsers.value, [msg.u]: Date.now() }
   }))
 
-  unsubs.push(socket.on('paste.opened', (msg) => {
-    if (msg.room_id !== room.value.id) return
-    const p = pastesByHash.value[msg.paste_hash]
-    if (p) {
-      pastesByHash.value[msg.paste_hash] = {
-        ...p,
-        opened_username: msg.opened_by,
-        can_open: false,
-      }
-    }
+  unsubs.push(socket.on('room.updated', (msg) => {
+    if (!room.value || msg.r !== room.value.id) return
+    api.get(`/rooms/${roomHash}`).then(res => {
+      room.value = res.data.room
+      memberCount.value = res.data.room.member_count ?? 0
+    }).catch(() => {})
   }))
 
-  unsubs.push(socket.on('paste.deleted', (msg) => {
-    if (msg.room_id !== room.value.id) return
-    const p = pastesByHash.value[msg.paste_hash]
-    if (p) {
-      pastesByHash.value[msg.paste_hash] = {
-        ...p,
-        deleted_at: new Date().toISOString(),
-        can_open: false,
-        can_done: false,
-        can_download: false,
-      }
-    }
+  unsubs.push(socket.on('room.deleted', (msg) => {
+    if (!room.value || msg.r !== room.value.id) return
+    alert('This room has been permanently deleted.')
+    router.push('/rooms')
   }))
 
   unsubs.push(socket.on('error', (msg) => {
@@ -433,34 +507,131 @@ async function connect() {
 }
 
 function onInput() {
-  if (!socket || isReadOnly.value) return
+  if (!socket || isReadOnly.value || !room.value) return
   const now = Date.now()
   if (now - lastTypingSent < 2000) return
   lastTypingSent = now
-  socket.send({ type: 'chat.typing', room_id: room.value.id })
+  socket.send({ t: 2, r: room.value.id })
 }
 
 async function send() {
-  if (!input.value.trim() || sending.value) return
+  if (!input.value.trim() || sending.value || !socket) return
+  
+  const textToSend = input.value
   sending.value = true
+  
   try {
-    const enc = await encryptMessage(roomKey, input.value)
+    const enc = await encryptMessage(roomAesKey.value, textToSend)
+    
     socket.send({
-      type: 'chat.send', room_id: room.value.id,
-      ct: enc.ct, iv: enc.iv, tag: enc.tag,
+      t: 0, 
+      r: room.value.id,
+      c: enc.ct, 
+      i: enc.iv, 
+      g: enc.tag,
     })
+
+    // Optimistic UI update
+    messages.value.push({
+      id: 'temp-' + Date.now(),
+      sender_id: myId.value,
+      text: textToSend,
+      ts: new Date().toISOString(),
+      edit_count: 0,
+      deleted_at: null
+    })
+
     input.value = ''
     await nextTick()
     if (logEl.value) logEl.value.scrollTop = logEl.value.scrollHeight
+    
+  } catch (e) {
+    console.error("Send failed:", e)
   } finally {
     sending.value = false
   }
 }
 
-// --- Paste creation ---
-function openPasteModal() {
-  showPasteModal.value = true
-  pasteMode.value = 'text'
+// ==========================================
+// MESSAGE EDIT / DELETE
+// ==========================================
+
+function startEdit(m) {
+  if (m.isPaste || m.deleted_at) return
+  if (typeof m.id === 'string' && m.id.startsWith('temp-')) {
+    alert('Message is still sending. Please wait a moment before editing.')
+    return
+  }
+  editingMessageId.value = m.id
+  editingText.value = m.text
+}
+
+function cancelEdit() {
+  editingMessageId.value = null
+  editingText.value = ''
+}
+
+async function saveEdit(m) {
+  if (!editingText.value.trim() || editingText.value === m.text) {
+    cancelEdit()
+    return
+  }
+
+  const newText = editingText.value
+  
+  // 1. Optimistic Update (Instant UI change)
+  const idx = messages.value.findIndex((x) => x.id === m.id)
+  if (idx !== -1) {
+    const updatedMsg = Object.assign({}, messages.value[idx], {
+      text: newText, 
+      edit_count: (messages.value[idx].edit_count || 0) + 1
+    })
+    messages.value.splice(idx, 1, updatedMsg)
+  }
+
+  try {
+    const enc = await encryptMessage(roomAesKey.value, newText)
+    await api.patch(`/rooms/${roomHash}/messages/${m.id}`, {
+      ct: enc.ct, iv: enc.iv, tag: enc.tag
+    })
+    cancelEdit()
+  } catch (e) {
+    alert(e.response?.data?.error || 'Edit failed')
+    // Reload to revert on failure
+    await loadInitialHistory()
+    cancelEdit()
+  }
+}
+
+async function deleteMessage(m) {
+  if (typeof m.id === 'string' && m.id.startsWith('temp-')) {
+    alert('Message is still sending. Please wait a moment before deleting.')
+    return
+  }
+  if (!confirm('Delete this message?')) return
+  
+  const idx = messages.value.findIndex((x) => x.id === m.id)
+  if (idx !== -1) {
+    const updatedMsg = Object.assign({}, messages.value[idx], {
+      deleted_at: new Date().toISOString()
+    })
+    messages.value.splice(idx, 1, updatedMsg)
+  }
+
+  try {
+    await api.delete(`/rooms/${roomHash}/messages/${m.id}`)
+  } catch (e) {
+    alert(e.response?.data?.error || 'Delete failed')
+    await loadInitialHistory()
+  }
+}
+
+// ==========================================
+// PASTE LOGIC
+// ==========================================
+
+function closePasteModal() {
+  showPasteModal.value = false
   pasteTitle.value = ''
   pasteText.value = ''
   pasteFile.value = null
@@ -468,220 +639,343 @@ function openPasteModal() {
   pasteProgress.value = 0
 }
 
-function closePasteModal() {
-  showPasteModal.value = false
-}
-
 function onPasteFile(e) {
-  pasteFile.value = e.target.files[0] || null
+  const f = e.target.files[0]
+  if (f && f.size > maxPasteSize.value) {
+    pasteError.value = `File too large. Max ${Math.round(maxPasteSize.value / 1024 / 1024)}MB.`
+    pasteFile.value = null
+    e.target.value = ''
+    return
+  }
+  pasteFile.value = f || null
+  pasteError.value = ''
 }
 
 async function submitPaste() {
-  pasteError.value = ''
-  if (!pasteTitle.value.trim()) {
-    pasteError.value = 'title is required'
-    return
-  }
+  if (!pasteTitle.value) return (pasteError.value = 'Title is required')
+  if (pasteMode.value === 'text' && !pasteText.value) return (pasteError.value = 'Text is required')
+  if (pasteMode.value === 'file' && !pasteFile.value) return (pasteError.value = 'File is required')
+
   pasteSubmitting.value = true
-  pasteProgress.value = 0
+  pasteError.value = ''
+  pasteProgress.value = 10
+
   try {
+    const pasteKey = await generateAesKey()
+    const wrappedKey = await encryptMessage(roomAesKey.value, pasteKey)
+    
     const form = new FormData()
-    form.append('title', pasteTitle.value.trim())
-    if (pasteMode.value === 'text') {
-      if (!pasteText.value) {
-        pasteError.value = 'text is empty'
-        pasteSubmitting.value = false
-        return
-      }
-      form.append('text', pasteText.value)
+    form.append('title', pasteTitle.value)
+    form.append('wrapped_key_ct', wrappedKey.ct)
+    form.append('wrapped_key_iv', wrappedKey.iv)
+    form.append('wrapped_key_tag', wrappedKey.tag)
+
+    if (pasteMode.value === 'file') {
+      pasteProgress.value = 30
+      const arrayBuffer = await pasteFile.value.arrayBuffer()
+      const key = await crypto.subtle.importKey(
+        'raw', Uint8Array.from(atob(pasteKey), c => c.charCodeAt(0)),
+        { name: 'AES-GCM' }, false, ['encrypt']
+      )
+      const iv = crypto.getRandomValues(new Uint8Array(12))
+      const encAes = await crypto.subtle.encrypt({ name: 'AES-GCM', iv }, key, arrayBuffer)
+      
+      const encBytes = new Uint8Array(encAes)
+      const ctBytes = encBytes.slice(0, encBytes.length - 16)
+      const tagBytes = encBytes.slice(encBytes.length - 16)
+
+      const combined = new Uint8Array(12 + 16 + ctBytes.length)
+      combined.set(iv, 0)
+      combined.set(tagBytes, 12)
+      combined.set(ctBytes, 28)
+
+      form.append('file', new Blob([combined]), pasteFile.value.name)
+      form.append('original_size', pasteFile.value.size)
+      form.append('mime_type', pasteFile.value.type)
+      form.append('file_name', pasteFile.value.name)
     } else {
-      if (!pasteFile.value) {
-        pasteError.value = 'no file selected'
-        pasteSubmitting.value = false
-        return
-      }
-      form.append('file', pasteFile.value)
+      const enc = await encryptMessage(pasteKey, pasteText.value)
+      form.append('content_ct', enc.ct)
+      form.append('content_iv', enc.iv)
+      form.append('content_tag', enc.tag)
     }
+
+    pasteProgress.value = 70
+
     const res = await api.post(`/rooms/${roomHash}/pastes`, form, {
       onUploadProgress: (e) => {
-        if (e.total) pasteProgress.value = Math.floor((e.loaded / e.total) * 100)
-      },
+        if (e.total) pasteProgress.value = 70 + Math.round((e.loaded * 30) / e.total)
+      }
     })
-    const p = res.data.paste
-    pastesByHash.value[p.public_hash] = {
-      title: p.title,
-      kind: p.kind,
-      file_name: p.file_name,
-      opened_username: null,
-      deleted_at: null,
-      is_sender: true,
-      can_open: true,
-      can_done: false,
-      can_download: p.kind === 'file',
-    }
-    showPasteModal.value = false
-    pasteTitle.value = ''
-    pasteText.value = ''
-    pasteFile.value = null
-    pasteProgress.value = 0
+
+    const newPaste = res.data.paste
+    const chatPayload = JSON.stringify({
+      _type: 'paste',
+      paste_hash: newPaste.public_hash,
+      title: newPaste.title,
+      kind: newPaste.kind,
+    })
+    const chatEnc = await encryptMessage(roomAesKey.value, chatPayload)
+    
+    socket.send({
+      t: 0, r: room.value.id,
+      c: chatEnc.ct, i: chatEnc.iv, g: chatEnc.tag,
+    })
+
+    // Optimistic Update for Paste
+    messages.value.push({
+      id: newPaste.id,
+      sender_id: myId.value,
+      isPaste: true,
+      paste: JSON.parse(chatPayload),
+      ts: new Date().toISOString(),
+      edit_count: 0,
+      deleted_at: null
+    })
+
+    closePasteModal()
+    scrollToBottom()
   } catch (e) {
-    pasteError.value = e.response?.data?.error || 'failed to create paste'
+    pasteError.value = e.response?.data?.error || e.message || 'Upload failed'
   } finally {
     pasteSubmitting.value = false
   }
 }
 
-// --- Paste actions ---
-async function openPaste(paste) {
+async function handlePasteClick(paste) {
+  const hash = paste.paste_hash
+  if (!hash) return
+  
+  openingPaste.value = hash
+  
+  openPasteHash.value = hash
+  openPasteTitle.value = paste.title
+  openPasteKind.value = paste.kind
+  openPasteContent.value = ''
+  pasteError.value = ''
+  showOpenPasteModal.value = true
+
   try {
-    const res = await api.post(`/pastes/${paste.paste_hash}/open`)
-    const p = res.data.paste
+    const res = await api.post(`/pastes/${hash}/open`)
+    const data = res.data.paste
+    openPasteFileName.value = data.file_name
 
-    if (p.peek) {
-      openPastePeek.value = true
-      if (p.kind === 'text' && p.content != null) {
-        openPasteContent.value = p.content
-        openPasteTitle.value = p.title
-        openPasteKind.value = 'text'
-        openPasteHash.value = paste.paste_hash
-        showOpenPasteModal.value = true
-      } else if (p.kind === 'file') {
-        openPasteTitle.value = p.title
-        openPasteKind.value = 'file'
-        openPasteHash.value = paste.paste_hash
-        openPasteFileName.value = p.file_name || p.title
-        openPasteContent.value = ''
-        showOpenPasteModal.value = true
-      }
-      return
-    }
+    const actualPasteKey = await decryptMessage(
+      roomAesKey.value, data.wrapped_key_encrypted, data.wrapped_key_iv, data.wrapped_key_tag
+    )
 
-    openPastePeek.value = false
-    pastesByHash.value[paste.paste_hash] = {
-      ...pastesByHash.value[paste.paste_hash],
-      opened_username: p.opened_username || auth.username,
-      can_open: false,
-      can_done: true,
-      can_download: p.kind === 'file',
-    }
-    if (p.kind === 'text' && p.content != null) {
-      openPasteContent.value = p.content
-      openPasteTitle.value = p.title
-      openPasteKind.value = 'text'
-      openPasteHash.value = paste.paste_hash
-      showOpenPasteModal.value = true
-    } else if (p.kind === 'file') {
-      openPasteTitle.value = p.title
-      openPasteKind.value = 'file'
-      openPasteHash.value = paste.paste_hash
-      openPasteFileName.value = p.file_name || p.title
-      openPasteContent.value = ''
-      showOpenPasteModal.value = true
+    if (data.kind === 'text') {
+      openPasteContent.value = await decryptMessage(actualPasteKey, data.content_encrypted, data.content_iv, data.content_tag)
     }
   } catch (e) {
-    alert(e.response?.data?.error || 'failed to open paste')
+    pasteError.value = e.response?.data?.error || 'Failed to decrypt paste'
+  } finally {
+    openingPaste.value = null
   }
 }
 
 function closeOpenPasteModal() {
   showOpenPasteModal.value = false
+  openPasteHash.value = ''
   openPasteContent.value = ''
-  openPasteHash.value = null
-  openPastePeek.value = false
 }
 
 async function copyOpenPaste() {
-  try { await navigator.clipboard.writeText(openPasteContent.value) } catch (e) {}
+  try {
+    await navigator.clipboard.writeText(openPasteContent.value)
+    alert('Copied to clipboard')
+  } catch (e) { alert('Copy failed') }
 }
 
 async function downloadPaste(paste) {
   downloading.value = paste.paste_hash
   downloadProgress.value = 0
   try {
-    const res = await api.get(`/pastes/${paste.paste_hash}/download`, {
-      responseType: 'blob',
-      onDownloadProgress: (e) => {
-        if (e.total) downloadProgress.value = Math.floor((e.loaded / e.total) * 100)
-      },
-    })
-    const url = window.URL.createObjectURL(res.data)
+    const res = await api.post(`/pastes/${paste.paste_hash}/open`)
+    const data = res.data.paste
+    
+    const actualPasteKey = await decryptMessage(
+      roomAesKey.value, data.wrapped_key_encrypted, data.wrapped_key_iv, data.wrapped_key_tag
+    )
+
+    const fileRes = await api.get(`/pastes/${paste.paste_hash}/download`, { responseType: 'arraybuffer' })
+    const blob = new Uint8Array(fileRes.data)
+    
+    const iv = blob.slice(0, 12)
+    const tag = blob.slice(12, 28)
+    const ct = blob.slice(28)
+    
+    function uint8ToBase64(bytes) {
+      let binary = ''
+      const chunkSize = 8192
+      for (let i = 0; i < bytes.length; i += chunkSize) {
+        const chunk = bytes.subarray(i, i + chunkSize)
+        binary += String.fromCharCode.apply(null, chunk)
+      }
+      return btoa(binary)
+    }
+    
+    const ctB64 = uint8ToBase64(ct)
+    const ivB64 = uint8ToBase64(iv)
+    const tagB64 = uint8ToBase64(tag)
+    
+    const ptBytes = await decryptBytes(actualPasteKey, ctB64, ivB64, tagB64)
+    const downloadBlob = new Blob([ptBytes], { type: data.mime_type })
+    
+    const url = window.URL.createObjectURL(downloadBlob)
     const a = document.createElement('a')
     a.href = url
-    a.download = paste.file_name || paste.title
+    a.download = data.file_name || data.title
     a.click()
     window.URL.revokeObjectURL(url)
   } catch (e) {
-    alert(e.response?.data?.error || 'failed to download')
+    alert('Download failed')
   } finally {
     downloading.value = null
     downloadProgress.value = 0
   }
 }
 
-async function donePaste(paste) {
-  if (!confirm('This will permanently delete the paste. Continue?')) return
+// ==========================================
+// INVITES & MANAGE
+// ==========================================
+
+async function searchUsers() {
+  inviteError.value = ''
+  inviteMessage.value = ''
+  if (!inviteQuery.value.trim()) { inviteResults.value = []; return }
   try {
-    await api.post(`/pastes/${paste.paste_hash}/done`)
-    pastesByHash.value[paste.paste_hash] = {
-      ...pastesByHash.value[paste.paste_hash],
-      deleted_at: new Date().toISOString(),
-      can_open: false,
-      can_done: false,
-      can_download: false,
-    }
+    const res = await api.get('/users', { params: { q: inviteQuery.value.trim() } })
+    inviteResults.value = res.data.users
   } catch (e) {
-    alert(e.response?.data?.error || 'failed')
+    inviteError.value = e.response?.data?.error || 'Search failed'
   }
 }
 
-// --- Report ---
-function openReportModal(m) {
-  if (m.isPaste || m.deleted_at) return
-  reportMessage.value = m
-  reportReason.value = ''
-  reportError.value = ''
-  showReportModal.value = true
-}
-
-function closeReportModal() {
-  showReportModal.value = false
-  reportMessage.value = null
-  reportReason.value = ''
-  reportError.value = ''
-}
-
-async function submitReport() {
-  if (!reportMessage.value) return
-  reportSubmitting.value = true
-  reportError.value = ''
+async function invite(user) {
+  inviteMessage.value = ''
   try {
-    await api.post(`/messages/${reportMessage.value.id}/report`, {
-      reason: reportReason.value || 'reported',
+    if (!user.kyber_public_key) {
+      throw new Error(`${user.username} has not generated a PQC identity yet.`)
+    }
+
+    const targetPkBytes = Uint8Array.from(atob(user.kyber_public_key), c => c.charCodeAt(0))
+    const kem = MlKemKeyPair.importKeys(new Uint8Array(0), targetPkBytes)
+    let payload
+    try {
+      const res = kem.encapsulate()
+      const ct = new Uint8Array(res[0])
+      const ss = new Uint8Array(res[1])
+
+      const sharedKey = await crypto.subtle.importKey('raw', ss, { name: 'AES-GCM' }, false, ['encrypt'])
+      const iv = crypto.getRandomValues(new Uint8Array(12))
+      const encAes = await crypto.subtle.encrypt({ name: 'AES-GCM', iv }, sharedKey, new TextEncoder().encode(roomAesKey.value))
+
+      payload = JSON.stringify({
+        ct: btoa(String.fromCharCode(...ct)),
+        iv: btoa(String.fromCharCode(...iv)),
+        enc_aes: btoa(String.fromCharCode(...new Uint8Array(encAes)))
+      })
+    } finally {
+      if (kem && kem.free) kem.free()
+    }
+
+    await api.post(`/rooms/${roomHash}/invite`, {
+      user_id: user.id,
+      target_kyber_ciphertext: payload
     })
-    reportedIds.value[reportMessage.value.id] = true
-    closeReportModal()
+
+    inviteMessage.value = `invited ${user.username}`
+    inviteResults.value = inviteResults.value.filter((u) => u.id !== user.id)
+    memberCount.value += 1
+    rememberName(user.id, user.username)
   } catch (e) {
-    if (e.response?.status === 409) {
-      reportedIds.value[reportMessage.value.id] = true
-      closeReportModal()
-    } else {
-      reportError.value = e.response?.data?.error || 'failed to report'
-    }
-  } finally {
-    reportSubmitting.value = false
+    inviteMessage.value = e.message || 'Invite failed'
   }
 }
 
-// --- Search ---
-const MAX_SEARCH_PAGES = 20
+function toggleInvite() {
+  showInvite.value = !showInvite.value
+  if (showInvite.value) { showSearch.value = false; closeManage() }
+  inviteQuery.value = ''
+  inviteResults.value = []
+  inviteMessage.value = ''
+  inviteError.value = ''
+}
+
+function toggleSearch() {
+  showSearch.value = !showSearch.value
+  if (showSearch.value) { showInvite.value = false; closeManage() }
+  if (!showSearch.value) {
+    searchQuery.value = ''
+    searchResults.value = []
+    searchDone.value = false
+    searchError.value = ''
+  }
+}
+
+function openManage() {
+  showManage.value = true
+  showInvite.value = false
+  showSearch.value = false
+  manageQuery.value = ''
+  manageResults.value = []
+  manageError.value = ''
+}
+
+function closeManage() {
+  showManage.value = false
+  manageQuery.value = ''
+  manageResults.value = []
+  manageError.value = ''
+  clearTimeout(manageDebounce)
+}
+
+function onManageInput() {
+  clearTimeout(manageDebounce)
+  manageDebounce = setTimeout(runManageSearch, 300)
+}
+
+async function runManageSearch() {
+  const q = manageQuery.value.trim()
+  if (!q) { manageResults.value = []; return }
+  manageSearching.value = true
+  manageError.value = ''
+  try {
+    const res = await api.get(`/rooms/${roomHash}/members`, {
+      params: { q, limit: 20, offset: 0 },
+    })
+    for (const m of res.data.members) rememberName(m.user_id, m.username)
+    manageResults.value = res.data.members
+  } catch (e) {
+    manageError.value = e.response?.data?.error || 'Search failed'
+  } finally {
+    manageSearching.value = false
+  }
+}
+
+async function removeMember(m) {
+  if (!confirm(`Remove ${m.username} from this room?`)) return
+  manageLoading.value = true
+  manageError.value = ''
+  try {
+    await api.post(`/rooms/${roomHash}/remove`, { user_id: m.user_id })
+    manageResults.value = manageResults.value.filter(x => x.user_id !== m.user_id)
+    memberCount.value = Math.max(0, memberCount.value - 1)
+    
+    const nextMap = { ...userNames.value }
+    delete nextMap[m.user_id]
+    userNames.value = nextMap
+  } catch (e) {
+    manageError.value = e.response?.data?.error || 'Remove failed'
+  } finally {
+    manageLoading.value = false
+  }
+}
 
 async function runSearch() {
   const q = searchQuery.value.trim().toLowerCase()
-  if (!q) {
-    searchResults.value = []
-    searchDone.value = false
-    return
-  }
+  if (!q) { searchResults.value = []; searchDone.value = false; return }
   searching.value = true
   searchError.value = ''
   searchDone.value = false
@@ -689,14 +983,15 @@ async function runSearch() {
   try {
     let before = null
     let pages = 0
-    while (pages < MAX_SEARCH_PAGES) {
+    while (pages < 20) {
       const params = before ? { before } : {}
       const res = await api.get(`/rooms/${roomHash}/messages`, { params })
       const batch = res.data.messages
       if (!batch.length) break
       for (const m of batch) {
+        if (m.sender_username) rememberName(m.sender_id, m.sender_username)
         const d = await decryptOne(m)
-        if (d.isPaste || d.deleted) continue
+        if (d.isPaste || d.deleted || d.error) continue
         if (d.text && d.text.toLowerCase().includes(q)) {
           searchResults.value.push({ id: m.id, sender_id: m.sender_id, text: d.text, ts: m.ts })
         }
@@ -705,23 +1000,11 @@ async function runSearch() {
       pages++
       if (batch.length < 100) break
     }
-    searchResults.value.sort((a, b) => new Date(a.ts) - new Date(b.ts))
     searchDone.value = true
   } catch (e) {
     searchError.value = e.response?.data?.error || 'Search failed'
   } finally {
     searching.value = false
-  }
-}
-
-function toggleSearch() {
-  showSearch.value = !showSearch.value
-  if (showSearch.value) { showInvite.value = false; showMembers.value = false; showBans.value = false }
-  if (!showSearch.value) {
-    searchQuery.value = ''
-    searchResults.value = []
-    searchDone.value = false
-    searchError.value = ''
   }
 }
 
@@ -747,200 +1030,27 @@ function snippet(text, q) {
   return (start > 0 ? '…' : '') + text.slice(start, end) + (end < text.length ? '…' : '')
 }
 
-async function searchUsers() {
-  inviteError.value = ''
-  inviteMessage.value = ''
-  if (!inviteQuery.value.trim()) { inviteResults.value = []; return }
-  try {
-    const res = await api.get('/users', { params: { q: inviteQuery.value.trim() } })
-    inviteResults.value = res.data.users
-  } catch (e) {
-    inviteError.value = e.response?.data?.error || 'Search failed'
-  }
-}
-
-async function invite(user) {
-  inviteMessage.value = ''
-  try {
-    await api.post(`/rooms/${roomHash}/invite`, { user_id: user.id })
-    inviteMessage.value = `invited ${user.username}`
-    inviteResults.value = inviteResults.value.filter((u) => u.id !== user.id)
-    await loadMembers()
-  } catch (e) {
-    inviteMessage.value = e.response?.data?.error || 'Invite failed'
-  }
-}
-
-function toggleInvite() {
-  showInvite.value = !showInvite.value
-  if (showInvite.value) { showMembers.value = false; showSearch.value = false; showBans.value = false }
-  inviteQuery.value = ''
-  inviteResults.value = []
-  inviteMessage.value = ''
-  inviteError.value = ''
-}
-
-async function toggleMembers() {
-  showMembers.value = !showMembers.value
-  if (showMembers.value) {
-    showInvite.value = false; showSearch.value = false; showBans.value = false
-    membersFilter.value = ''
-    await loadMembers()
-  }
-}
-
-async function toggleBans() {
-  showBans.value = !showBans.value
-  if (showBans.value) {
-    showInvite.value = false; showMembers.value = false; showSearch.value = false
-    banQuery.value = ''
-    banResults.value = []
-    banError.value = ''
-    await loadBans()
-  }
-}
-
-async function searchUsersForBan() {
-  banError.value = ''
-  if (!banQuery.value.trim()) { banResults.value = []; return }
-  banLoading.value = true
-  try {
-    const res = await api.get('/users', { params: { q: banQuery.value.trim() } })
-    banResults.value = res.data.users.filter(u => u.username !== auth.username)
-  } catch (e) {
-    banError.value = e.response?.data?.error || 'Search failed'
-  } finally {
-    banLoading.value = false
-  }
-}
-
-async function banUser(user) {
-  if (!confirm(`Ban ${user.username} from this room? They cannot rejoin unless you unban them.`)) return
-  try {
-    await api.post(`/rooms/${roomHash}/remove`, { user_id: user.id })
-    banResults.value = banResults.value.filter(u => u.id !== user.id)
-    await loadMembers()
-    await loadBans()
-  } catch (e) {
-    alert(e.response?.data?.error || 'Ban failed')
-  }
-}
-
-async function removeMember(user) {
-  if (!confirm(`Remove and BAN ${user.username}? They cannot rejoin unless you unban them.`)) return
-  try {
-    await api.post(`/rooms/${roomHash}/remove`, { user_id: user.user_id })
-    await loadMembers()
-    await loadBans()
-  } catch (e) {
-    alert(e.response?.data?.error || 'Remove failed')
-  }
-}
-
-async function unbanUser(u) {
-  if (!confirm(`Unban ${u.username}? They can rejoin.`)) return
-  try {
-    await api.delete(`/rooms/${roomHash}/ban/${u.user_id}`)
-    await loadBans()
-  } catch (e) {
-    alert(e.response?.data?.error || 'Unban failed')
-  }
-}
-
-function canEdit(m) {
-  if (m.isPaste || m.deleted_at) return false
-  return m.sender_id === myId.value || canManage.value
-}
-
-async function deleteMessage(m) {
-  if (!confirm('Delete this message?')) return
-  try { await api.delete(`/rooms/${roomHash}/messages/${m.id}`) }
-  catch (e) { alert(e.response?.data?.error || 'Delete failed') }
-}
-
-function startEdit(m) {
-  if (m.isPaste || m.deleted_at) return
-  editingId.value = m.id
-  editingText.value = m.text
-}
-function cancelEdit() { editingId.value = null; editingText.value = '' }
-
-async function saveEdit(m) {
-  if (!editingText.value.trim()) return
-  try {
-    const enc = await encryptMessage(roomKey, editingText.value)
-    await api.patch(`/rooms/${roomHash}/messages/${m.id}`, {
-      ct: enc.ct, iv: enc.iv, tag: enc.tag,
-    })
-    cancelEdit()
-  } catch (e) {
-    alert(e.response?.data?.error || 'Edit failed')
-  }
-}
-
-async function joinRoom() {
-  joining.value = true
-  try {
-    await api.post(`/rooms/${roomHash}/join`)
-    needsJoin.value = false
-    await loadRoom()
-    await loadKey()
-    await loadMembers()
-    await loadInitialHistory()
-    await markRead()
-    await connect()
-    typingCleanupTimer = setInterval(cleanupTyping, 2000)
-  } catch (e) {
-    if (e.response?.status === 403) {
-      error.value = e.response?.data?.error || 'Cannot join this room.'
-    } else {
-      error.value = e.response?.data?.error || 'Failed to join'
-    }
-  } finally {
-    joining.value = false
-  }
-}
-
-function linkify(text) {
-  if (!text) return ''
-  
-  // First, escape HTML to prevent XSS (important!)
-  const escaped = text
-    .replace(/&/g, '&amp;')
-    .replace(/</g, '&lt;')
-    .replace(/>/g, '&gt;')
-    .replace(/"/g, '&quot;')
-    .replace(/'/g, '&#039;')
-
-  // Regex to find URLs
-  const urlRegex = /(https?:\/\/[^\s]+)/g
-  
-  // Replace URLs with anchor tags
-  return escaped.replace(urlRegex, (url) => {
-    return `<a href="${url}" target="_blank" rel="noopener noreferrer" class="text-emerald-400 hover:text-emerald-300 underline">${url}</a>`
-  })
-}
-
 onMounted(async () => {
   isComponentMounted = true
+  try {
+    const configRes = await api.get('/config')
+    if (configRes.data.max_paste_size) maxPasteSize.value = configRes.data.max_paste_size
+  } catch(e) {}
+
   try {
     await loadMe()
     const ok = await loadRoom()
     if (!ok) { initialLoading.value = false; return }
-    await loadKey()
-    await loadMembers()
-    await loadInitialHistory()
-    await markRead()
-    await connect()
-    typingCleanupTimer = setInterval(cleanupTyping, 2000)
+    
+    loadNames()
+    
+    if (room.value.is_member) needsUnlock.value = true
   } catch (e) {
     if (e.response?.status === 404) error.value = 'Room not found.'
     else if (e.response?.status === 403) error.value = 'You do not have access to this room.'
     else error.value = e.response?.data?.error || e.message
   } finally {
     initialLoading.value = false
-    await nextTick()
-    if (logEl.value) logEl.value.scrollTop = logEl.value.scrollHeight
   }
 })
 
@@ -949,40 +1059,90 @@ onBeforeUnmount(() => {
   isConnected.value = false
   unsubs.forEach((fn) => fn())
   unsubs = []
-  if (socket) socket.send({ type: 'chat.leave' })
+  if (socket) socket.send({ t: 4 })
   if (typingCleanupTimer) clearInterval(typingCleanupTimer)
   if (highlightTimer) clearTimeout(highlightTimer)
+  clearTimeout(manageDebounce)
 })
 </script>
 
 <template>
-  <div class="flex flex-col h-[calc(100dvh-3.5rem)] lg:h-[calc(100dvh-3rem)] -my-6 -mx-4 sm:-mx-6 font-mono">
+  <div class="flex flex-col h-[calc(100dvh-3.5rem)] lg:h-[calc(100dvh-3rem)] -my-6 -mx-4 sm:-mx-6 font-mono relative">
+    <!-- Header -->
     <div class="flex items-center justify-between px-4 sm:px-6 py-3 border-b border-gray-800 bg-gray-950/80 backdrop-blur sticky top-0 z-10">
       <div class="min-w-0 flex items-center gap-2 flex-1">
         <button @click="router.push('/rooms')" class="text-gray-500 hover:text-emerald-400 text-sm flex-shrink-0" title="Back to rooms">&lt;</button>
         <span class="text-emerald-400 flex-shrink-0">{{ room && room.type === 'channel' ? '#' : room && room.type === 'private' ? '@' : '>' }}</span>
         <span class="text-white font-medium truncate">{{ room ? room.name : 'room' }}</span>
-        <span v-if="room" class="text-xs text-gray-500 ml-1 hidden sm:inline flex-shrink-0">[{{ room.type }}]</span>
-        <span v-if="room && room.is_invite_only" class="text-xs text-yellow-500 ml-1 flex-shrink-0" title="invite only">🔒</span>
         <span v-if="!isSocketConnected" class="text-xs text-red-500 animate-pulse ml-2 flex-shrink-0" title="Reconnecting...">● offline</span>
-        <span v-if="isReadOnly" class="text-xs text-red-400 ml-1 flex-shrink-0 hidden sm:inline">read-only</span>
       </div>
-      <div class="flex items-center gap-1 flex-shrink-0">
-        <button v-if="room && room.is_member" @click="toggleSearch" :class="['px-2.5 py-1 rounded-md text-xs transition-colors', showSearch ? 'bg-gray-800 text-emerald-400' : 'text-gray-400 hover:bg-gray-800 hover:text-white']" title="Search messages">⌕</button>
-        <router-link
-          :to="`/rooms/${roomHash}/members`"
-          class="px-2.5 py-1 rounded-md text-xs transition-colors text-gray-400 hover:bg-gray-800 hover:text-white"
+      <div class="flex items-center gap-1 flex-shrink-0" v-if="room && room.is_member">
+        <button
+          @click="toggleSearch"
+          :class="['px-2.5 py-1 rounded-md text-xs transition-colors', showSearch ? 'bg-gray-800 text-emerald-400' : 'text-gray-400 hover:bg-gray-800 hover:text-white']"
+          title="Search messages">⌕</button>
+
+        <button
+          @click="router.push(`/rooms/${roomHash}/members`)"
+          class="px-2.5 py-1 rounded-md text-xs text-gray-400 hover:bg-gray-800 hover:text-white"
+          title="View all members"
         >
-          members <span class="text-gray-600">({{ members.length }})</span>
-        </router-link>
-        <button v-if="canManage" @click="toggleInvite" :class="['px-2.5 py-1 rounded-md text-xs transition-colors', showInvite ? 'bg-emerald-500/10 text-emerald-400' : 'text-gray-400 hover:bg-gray-800 hover:text-white']">
+          members <span class="text-gray-600">({{ memberCount }})</span>
+        </button>
+
+        <button
+          v-if="canManage"
+          @click="openManage"
+          :class="['px-2.5 py-1 rounded-md text-xs transition-colors', showManage ? 'bg-red-500/10 text-red-400' : 'text-gray-400 hover:bg-gray-800 hover:text-white']"
+          title="Manage members"
+        >
+          manage
+        </button>
+
+        <button
+          v-if="canManage"
+          @click="toggleInvite"
+          :class="['px-2.5 py-1 rounded-md text-xs transition-colors', showInvite ? 'bg-emerald-500/10 text-emerald-400' : 'text-gray-400 hover:bg-gray-800 hover:text-white']"
+        >
           + invite
         </button>
-        <button v-if="isOwner" @click="toggleBans" :class="['px-2.5 py-1 rounded-md text-xs transition-colors', showBans ? 'bg-red-500/10 text-red-400' : 'text-gray-400 hover:bg-gray-800 hover:text-red-400']">banned</button>
+
+        <button
+          v-if="room && room.is_member && (room.owner_id !== myId || (room.is_ephemeral && memberCount === 1))"
+          @click="leaveRoom"
+          class="px-2.5 py-1 rounded-md text-xs text-gray-400 hover:bg-red-500/10 hover:text-red-400 transition-colors"
+          title="Leave this room"
+        >
+          leave
+        </button>
+
+        <button
+          v-if="room && room.is_member && room.owner_id === myId"
+          @click="deleteRoom"
+          class="px-2.5 py-1 rounded-md text-xs text-gray-400 hover:bg-red-500/20 hover:text-red-300 transition-colors font-bold"
+          title="Delete this room permanently"
+        >
+          delete room
+        </button>
       </div>
     </div>
 
-    <div v-if="showSearch" class="px-4 sm:px-6 py-3 border-b border-gray-800 bg-gray-900">
+    <!-- Invite Panel -->
+    <div v-if="showInvite" class="px-4 sm:px-6 py-3 border-b border-gray-800 bg-gray-900 z-20">
+      <div class="text-xs text-gray-500 mb-2">// invite by username</div>
+      <input v-model="inviteQuery" @input="searchUsers" placeholder="search username" autocomplete="off" class="w-full bg-gray-950 border border-gray-800 text-emerald-300 px-3 py-1.5 rounded-md text-sm focus:outline-none focus:border-emerald-500 placeholder-gray-600" />
+      <p v-if="inviteError" class="text-xs text-red-400 mt-2">{{ inviteError }}</p>
+      <p v-if="inviteMessage" class="text-xs text-emerald-400 mt-2">{{ inviteMessage }}</p>
+      <ul v-if="inviteResults.length" class="mt-2 space-y-1">
+        <li v-for="u in inviteResults" :key="u.id" class="flex items-center justify-between text-sm">
+          <span class="text-gray-300">@{{ u.username }}</span>
+          <button @click="invite(u)" class="text-xs text-emerald-400 hover:text-emerald-300">+ invite</button>
+        </li>
+      </ul>
+    </div>
+
+    <!-- Search Panel -->
+    <div v-if="showSearch" class="px-4 sm:px-6 py-3 border-b border-gray-800 bg-gray-900 z-20">
       <div class="text-xs text-gray-500 mb-2">// search messages (last 2,000)</div>
       <div class="flex gap-2">
         <input v-model="searchQuery" @keyup.enter="runSearch" placeholder="search query, then enter" autocomplete="off" class="flex-1 bg-gray-950 border border-gray-800 text-emerald-300 px-3 py-1.5 rounded-md text-sm focus:outline-none focus:border-emerald-500 placeholder-gray-600" />
@@ -1001,178 +1161,188 @@ onBeforeUnmount(() => {
       </ul>
     </div>
 
-    <div v-if="showInvite" class="px-4 sm:px-6 py-3 border-b border-gray-800 bg-gray-900">
-      <div class="text-xs text-gray-500 mb-2">// invite by username</div>
-      <input v-model="inviteQuery" @input="searchUsers" placeholder="search username" autocomplete="off" class="w-full bg-gray-950 border border-gray-800 text-emerald-300 px-3 py-1.5 rounded-md text-sm focus:outline-none focus:border-emerald-500 placeholder-gray-600" />
-      <p v-if="inviteError" class="text-xs text-red-400 mt-2">{{ inviteError }}</p>
-      <p v-if="inviteMessage" class="text-xs text-emerald-400 mt-2">{{ inviteMessage }}</p>
-      <ul v-if="inviteResults.length" class="mt-2 space-y-1">
-        <li v-for="u in inviteResults" :key="u.id" class="flex items-center justify-between text-sm">
-          <span class="text-gray-300">@{{ u.username }}</span>
-          <button @click="invite(u)" class="text-xs text-emerald-400 hover:text-emerald-300">+ invite</button>
-        </li>
-      </ul>
-    </div>
-
-    <div v-if="showBans" class="px-4 sm:px-6 py-3 border-b border-gray-800 bg-gray-900">
-      <div class="text-xs text-gray-500 mb-2">// ban a user from this room</div>
-      <input v-model="banQuery" @input="searchUsersForBan" placeholder="search username to ban" autocomplete="off" class="w-full bg-gray-950 border border-red-500/30 text-red-300 px-3 py-1.5 rounded-md text-sm focus:outline-none focus:border-red-500 placeholder-gray-600" />
-      <p v-if="banError" class="text-xs text-red-400 mt-2">{{ banError }}</p>
-      <p v-if="banLoading" class="text-xs text-gray-500 mt-2">searching...</p>
-      <ul v-if="banResults.length" class="mt-2 space-y-1">
-        <li v-for="u in banResults" :key="u.id" class="flex items-center justify-between text-sm">
-          <span class="text-gray-300">@{{ u.username }}</span>
-          <button @click="banUser(u)" class="text-xs text-red-400 hover:text-red-300">ban</button>
-        </li>
-      </ul>
-      <div class="text-xs text-gray-500 mt-4 mb-2">// banned users ({{ bannedUsers.length }})</div>
-      <ul v-if="bannedUsers.length" class="space-y-1 max-h-60 overflow-y-auto">
-        <li v-for="b in bannedUsers" :key="b.user_id" class="flex items-center gap-2 text-sm">
-          <span class="text-gray-300 truncate">{{ b.username }}</span>
-          <span class="text-xs text-gray-600">banned {{ formatTs(b.banned_at) }}</span>
-          <button @click="unbanUser(b)" class="ml-auto text-xs text-emerald-400 hover:text-emerald-300 flex-shrink-0">unban</button>
-        </li>
-      </ul>
-      <p v-else class="text-xs text-gray-600">no banned users</p>
-    </div>
-
-    <div v-if="needsJoin" class="px-4 sm:px-6 py-8 text-center">
-      <p class="text-sm text-gray-400 mb-4">You're not a member of this room yet.</p>
-      <button @click="joinRoom" :disabled="joining" class="px-5 py-2 rounded-md bg-emerald-600 hover:bg-emerald-500 text-gray-950 font-bold font-mono text-sm transition-colors disabled:bg-gray-700 disabled:text-gray-500">
-        {{ joining ? 'joining...' : '> join room' }}
-      </button>
-    </div>
-
-    <div v-if="error" class="px-4 sm:px-6 py-3">
-      <ErrorBanner :message="error" />
-      <button @click="router.push('/rooms')" class="text-xs text-emerald-400 hover:underline mt-1">&lt; back to rooms</button>
-    </div>
-
-    <LoadingSpinner v-if="initialLoading" label="loading messages..." />
-
-    <div v-else-if="!error && !needsJoin" ref="logEl" @scroll="onScroll" class="flex-1 overflow-y-auto px-4 sm:px-6 py-4 space-y-1">
-      <div v-if="loadingOlder" class="text-center text-xs text-gray-500 py-2">loading older messages...</div>
-      <div v-else-if="!hasMore && messages.length" class="text-center text-xs text-gray-600 py-2">// start of conversation</div>
-      <div v-if="!messages.length" class="text-center text-xs text-gray-600 py-8">// no messages yet</div>
-
-      <div
-        v-for="m in messages"
-        :key="m.id"
-        :data-mid="m.id"
-        :class="['group flex gap-2 rounded-md transition-colors', m.sender_id === myId ? 'justify-end' : 'justify-start']"
-      >
-        <div v-if="m.sender_id !== myId" class="w-8 h-8 rounded-full bg-gray-800 flex items-center justify-center text-[10px] text-emerald-400 font-bold flex-shrink-0 mt-1">
-          {{ initials(m.sender_id) }}
-        </div>
-        <div :class="['max-w-[75%] flex flex-col', m.sender_id === myId ? 'items-end' : 'items-start']">
-          <div :class="['text-[10px] mb-0.5 flex items-center gap-2 flex-wrap', m.sender_id === myId ? 'text-emerald-400' : 'text-gray-400']">
-            <span class="font-medium">{{ nameOf(m.sender_id) }}</span>
-            <span class="text-gray-600">{{ formatTs(m.ts) }}</span>
-            <span v-if="m.edit_count" class="text-cyan-500">[edited {{ m.edit_count }}x]</span>
-            <span v-if="m.deleted_at" class="text-red-500">[deleted]</span>
-          </div>
-
-          <template v-if="m.isPaste">
-            <div class="border border-cyan-500/40 bg-cyan-500/5 rounded-lg p-3 min-w-[260px] max-w-full">
-              <div class="flex items-start gap-2">
-                <span class="text-cyan-400 text-lg leading-none">📋</span>
-                <div class="min-w-0 flex-1">
-                  <div class="text-white font-medium truncate">{{ m.paste.title }}</div>
-                  <div class="text-[10px] text-gray-500 mt-0.5">
-                    {{ m.paste.kind === 'file' ? 'file' : 'text' }}
-                    · by {{ nameOf(m.sender_id) }}
-                    <template v-if="pastesByHash[m.paste.paste_hash]?.deleted_at">
-                      · deleted
-                    </template>
-                    <template v-else-if="pastesByHash[m.paste.paste_hash]?.opened_username">
-                      · opened by {{ pastesByHash[m.paste.paste_hash].opened_username }}
-                    </template>
-                    <template v-else>
-                      · ready
-                    </template>
-                  </div>
-                </div>
-              </div>
-              <div class="flex gap-2 mt-2 text-xs justify-end flex-wrap items-center">
-                <template v-if="pastesByHash[m.paste.paste_hash]?.deleted_at">
-                  <span class="text-gray-600">deleted</span>
-                </template>
-                <template v-else-if="pastesByHash[m.paste.paste_hash]?.can_done">
-                  <span v-if="downloading === m.paste.paste_hash" class="text-cyan-400 text-[10px]">↓ {{ downloadProgress }}%</span>
-                  <button v-else-if="pastesByHash[m.paste.paste_hash]?.can_download" @click="downloadPaste(m.paste)" class="text-cyan-400 hover:text-cyan-300">↓ download</button>
-                  <button @click="donePaste(m.paste)" class="text-emerald-400 hover:text-emerald-300">done</button>
-                </template>
-                <template v-else-if="pastesByHash[m.paste.paste_hash]?.is_sender && m.paste.kind === 'file'">
-                  <span v-if="downloading === m.paste.paste_hash" class="text-cyan-400 text-[10px]">↓ {{ downloadProgress }}%</span>
-                  <button v-else @click="downloadPaste(m.paste)" class="text-cyan-400 hover:text-cyan-300">↓ download</button>
-                  <button @click="openPaste(m.paste)" class="text-gray-400 hover:text-emerald-400">peek</button>
-                </template>
-                <template v-else-if="pastesByHash[m.paste.paste_hash]?.can_open">
-                  <button @click="openPaste(m.paste)" class="text-emerald-400 hover:text-emerald-300">open</button>
-                  <span v-if="pastesByHash[m.paste.paste_hash]?.is_sender" class="text-gray-600 text-[10px]">(peek)</span>
-                </template>
-                <template v-else>
-                  <span class="text-gray-600">opened</span>
-                </template>
-              </div>
-            </div>
-          </template>
-
-          <template v-else-if="m.deleted_at">
-            <div class="px-3 py-2 rounded-2xl text-sm italic text-gray-500 border border-gray-800 bg-gray-900/50">
-              [deleted message]
-            </div>
-          </template>
-
-          <template v-else>
-            <template v-if="editingId === m.id">
-              <div class="flex gap-1 items-center">
-                <input v-model="editingText" @keyup.enter="saveEdit(m)" @keyup.escape="cancelEdit" class="bg-gray-950 border border-emerald-500/40 text-emerald-200 px-3 py-1.5 rounded-lg text-sm focus:outline-none focus:border-emerald-500 min-w-[200px]" />
-                <button @click="saveEdit(m)" class="text-xs text-emerald-400 hover:text-emerald-300">save</button>
-                <button @click="cancelEdit" class="text-xs text-gray-500 hover:text-gray-400">cancel</button>
-              </div>
-            </template>
-            <template v-else>
-                <div 
-                  :class="['px-3 py-2 rounded-2xl text-sm whitespace-pre-wrap break-words', m.sender_id === myId ? 'bg-emerald-600/20 text-emerald-100 border border-emerald-600/30 rounded-tr-sm' : 'bg-gray-800 text-gray-100 border border-gray-700 rounded-tl-sm']"
-                  v-html="linkify(m.text)"
-                ></div>              
-                <div class="opacity-0 group-hover:opacity-100 transition-opacity flex gap-2 text-[10px] mt-0.5">
-                <template v-if="canEdit(m)">
-                  <button @click="startEdit(m)" class="text-gray-500 hover:text-emerald-400">edit</button>
-                  <button @click="deleteMessage(m)" class="text-gray-500 hover:text-red-400">delete</button>
-                </template>
-                <button
-                  v-if="!reportedIds[m.id]"
-                  @click="openReportModal(m)"
-                  class="text-gray-500 hover:text-yellow-400"
-                >report</button>
-                <span v-else class="text-yellow-500">reported</span>
-              </div>
-            </template>
-          </template>
-        </div>
+    <!-- Unlock Screen -->
+    <div v-if="needsUnlock" class="flex-1 flex items-center justify-center p-6 relative z-10">
+      <div class="bg-gray-900 border border-gray-800 rounded-lg p-6 w-full max-w-md">
+        <h3 class="text-white text-lg mb-2">Unlock Room</h3>
+        
+        <p v-if="room.is_public" class="text-xs text-gray-400 mb-4">
+          This is a public {{ room.type === 'channel' ? 'channel' : 'room' }}. Just click unlock to load the messages.
+        </p>
+        <p v-else class="text-xs text-gray-400 mb-4">
+          Enter your passphrase to decrypt this private {{ room.type === 'channel' ? 'channel' : 'room' }}.
+        </p>
+        
+        <input
+          v-if="!room.is_public"
+          v-model="passphrase"
+          type="password"
+          placeholder="passphrase"
+          class="w-full bg-gray-950 border border-gray-800 text-emerald-300 px-3 py-2 rounded-md text-sm mb-3 focus:outline-none focus:border-emerald-500"
+        />
+        
+        <button
+          @click="unlockRoom"
+          :disabled="unlocking"
+          class="w-full bg-emerald-600 hover:bg-emerald-500 text-gray-950 font-bold py-2 rounded-md text-sm disabled:bg-gray-700"
+        >
+          {{ unlocking ? 'Unlocking...' : 'Unlock' }}
+        </button>
+        <p v-if="error" class="text-xs text-red-400 mt-2">{{ error }}</p>
+        <p v-if="keyMissing" class="text-xs text-yellow-400 mt-2">
+          // no key envelope for you yet — ask the owner to re-invite you
+        </p>
       </div>
     </div>
 
-    <div v-if="!error && !needsJoin" class="border-t border-gray-800 bg-gray-950">
-      <div v-if="typingLabel" class="px-4 sm:px-6 pt-2 text-xs text-gray-500 italic">{{ typingLabel }}</div>
-      <form @submit.prevent="send" class="px-4 sm:px-6 py-3">
-        <div v-if="isReadOnly" class="text-xs text-gray-500 py-1">// read-only channel — only owner/admin can post</div>
-        <div v-else class="flex gap-2 items-center">
-          <span class="text-emerald-400 font-bold">&gt;</span>
-          <input v-model="input" @input="onInput" :disabled="initialLoading" placeholder="type a message..." class="flex-1 bg-transparent text-gray-100 px-0 py-2 text-sm focus:outline-none placeholder-gray-600" />
-          <button type="button" @click="openPasteModal" class="px-2 py-1.5 rounded-md text-gray-400 hover:text-cyan-400 hover:bg-gray-800 transition-colors" title="Create paste">📎</button>
-          <button type="submit" :disabled="!input.trim() || sending" class="px-4 py-1.5 rounded-md bg-emerald-600 hover:bg-emerald-500 text-gray-950 font-bold text-sm transition-colors disabled:bg-gray-800 disabled:text-gray-600">send</button>
-        </div>
-      </form>
+    <!-- Not a member Screen -->
+    <div v-if="needsInvite" class="px-4 sm:px-6 py-8 text-center flex flex-col items-center justify-center flex-1">
+      <p class="text-sm text-gray-400 mb-2">You are not a member of this room.</p>
+      <p class="text-xs text-gray-500 mb-4">This room is private and end-to-end encrypted. You must be invited by the owner.</p>
+      <button @click="router.push('/rooms')" class="px-5 py-2 rounded-md bg-gray-800 hover:bg-gray-700 text-gray-300 font-bold text-sm transition-colors">
+        &lt; back to rooms
+      </button>
     </div>
+
+    <!-- Main Chat Area -->
+    <template v-if="!needsUnlock && !needsInvite && !error">
+      <div ref="logEl" @scroll="onScroll" class="flex-1 overflow-y-auto px-4 sm:px-6 py-4 space-y-1">
+        <div v-if="loadingOlder" class="text-center text-xs text-gray-500 py-2">loading older messages...</div>
+        <div v-else-if="!hasMore && messages.length" class="text-center text-xs text-gray-600 py-2">// start of conversation</div>
+        <div v-if="!messages.length" class="text-center text-xs text-gray-600 py-8">// no messages yet</div>
+
+        <div
+          v-for="m in messages"
+          :key="m.id + (m.deleted_at ? '_deleted' : '')"
+          :data-mid="m.id"
+          @mouseenter="hoveredMessageId = m.id"
+          @mouseleave="hoveredMessageId = null"
+          :class="['group flex gap-2 rounded-md transition-colors relative', m.sender_id === myId ? 'justify-end' : 'justify-start']"
+        >
+          <div v-if="m.sender_id !== myId" class="w-8 h-8 rounded-full bg-gray-800 flex items-center justify-center text-[10px] text-emerald-400 font-bold flex-shrink-0 mt-1">
+            {{ initials(m.sender_id) }}
+          </div>
+          <div :class="['max-w-[75%] flex flex-col', m.sender_id === myId ? 'items-end' : 'items-start']">
+            <div :class="['text-[10px] mb-0.5 flex items-center gap-2 flex-wrap', m.sender_id === myId ? 'text-emerald-400' : 'text-gray-400']">
+              <span class="font-medium">{{ nameOf(m.sender_id) }}</span>
+              <span class="text-gray-600">{{ formatTs(m.ts) }}</span>
+              <span v-if="m.edit_count" class="text-cyan-500">[edited {{ m.edit_count }}x]</span>
+              <span v-if="m.deleted_at" class="text-red-500">[deleted]</span>
+            </div>
+
+            <!-- Deleted State -->
+            <template v-if="m.deleted_at">
+              <div class="px-3 py-2 rounded-2xl text-sm italic text-gray-500 border border-gray-800 bg-gray-900/50">
+                [deleted message]
+              </div>
+            </template>
+
+            <!-- Paste State -->
+            <template v-else-if="m.isPaste">
+              <div 
+                @click="handlePasteClick(m.paste)"
+                class="border border-cyan-500/40 bg-cyan-500/5 hover:bg-cyan-500/10 cursor-pointer rounded-lg p-3 min-w-[260px] max-w-full transition-colors"
+              >
+                <div class="flex items-center gap-2">
+                  <span class="text-cyan-400 text-lg">📎</span>
+                  <div class="min-w-0">
+                    <div class="text-white font-medium truncate">{{ m.paste.title }}</div>
+                    <div class="text-[10px] text-gray-500 mt-0.5">by {{ nameOf(m.sender_id) }} · {{ m.paste.kind }}</div>
+                  </div>
+                </div>
+                <div v-if="openingPaste === m.paste.paste_hash" class="text-xs text-cyan-400 mt-2 animate-pulse">
+                  Decrypting...
+                </div>
+              </div>
+            </template>
+
+            <!-- Decrypt Error -->
+            <template v-else-if="m.decryptError">
+              <div class="px-3 py-2 rounded-2xl text-sm italic text-yellow-500 border border-yellow-500/30 bg-yellow-500/5">
+                [could not decrypt]
+              </div>
+            </template>
+
+            <!-- Editing State -->
+            <template v-else-if="editingMessageId === m.id">
+              <div class="flex flex-col gap-2 items-end w-full">
+                <input 
+                  v-model="editingText" 
+                  @keyup.enter="saveEdit(m)" 
+                  @keyup.escape="cancelEdit"
+                  class="w-full min-w-[300px] bg-gray-900 border border-emerald-500/50 text-gray-100 px-3 py-2 rounded-md text-sm focus:outline-none focus:border-emerald-500"
+                  autofocus
+                />
+                <div class="flex gap-2 text-xs">
+                  <button @click="cancelEdit" class="text-gray-400 hover:text-white">cancel</button>
+                  <button @click="saveEdit(m)" class="text-emerald-400 hover:text-emerald-300 font-bold">save</button>
+                </div>
+              </div>
+            </template>
+
+            <!-- Normal Message -->
+            <template v-else>
+              <div 
+                :class="[
+                  'px-3 py-2 rounded-2xl text-sm whitespace-pre-wrap break-words border relative', 
+                  m.sender_id === myId 
+                    ? 'bg-emerald-600/20 text-emerald-100 border-emerald-600/30 rounded-tr-sm' 
+                    : 'bg-gray-800 text-gray-100 border-gray-700 rounded-tl-sm',
+                  m.loading ? 'opacity-50 italic' : ''
+                ]"
+              >
+                {{ m.text }}
+                
+                <!-- HOVER ACTIONS (EDIT/DELETE) -->
+                <div 
+                  v-if="m.sender_id === myId && !m.loading && hoveredMessageId === m.id && !(typeof m.id === 'string' && m.id.startsWith('temp-'))" 
+                  class="absolute -top-3 -left-16 flex gap-1 bg-gray-900 border border-gray-800 rounded-md px-1 py-0.5 shadow-lg z-10"
+                >
+                  <button @click="startEdit(m)" class="text-gray-400 hover:text-cyan-400 p-1" title="Edit">
+                    <svg class="w-3.5 h-3.5" fill="none" stroke="currentColor" viewBox="0 0 24 24"><path stroke-linecap="round" stroke-linejoin="round" stroke-width="2" d="M15.232 5.232l3.536 3.536m-2.036-5.036a2.5 2.5 0 113.536 3.536L6.5 21.036H3v-3.572L16.732 3.732z"/></svg>
+                  </button>
+                  <button @click="deleteMessage(m)" class="text-gray-400 hover:text-red-400 p-1" title="Delete">
+                    <svg class="w-3.5 h-3.5" fill="none" stroke="currentColor" viewBox="0 0 24 24"><path stroke-linecap="round" stroke-linejoin="round" stroke-width="2" d="M19 7l-.867 12.142A2 2 0 0116.138 21H7.862a2 2 0 01-1.995-1.858L5 7m5 4v6m4-6v6m1-10V4a1 1 0 00-1-1h-4a1 1 0 00-1 1v3M4 7h16"/></svg>
+                  </button>
+                </div>
+              </div>
+            </template>
+          </div>
+        </div>
+      </div>
+
+      <div class="border-t border-gray-800 bg-gray-950">
+        <div v-if="typingLabel" class="px-4 sm:px-6 pt-2 text-xs text-gray-500 italic">{{ typingLabel }}</div>
+        <form @submit.prevent="send" class="px-4 sm:px-6 py-3">
+          <div v-if="isReadOnly" class="text-xs text-gray-500 py-1">// read-only channel</div>
+          <div v-else class="flex gap-2 items-center">
+            <span class="text-emerald-400 font-bold">&gt;</span>
+            <input v-model="input" @input="onInput" placeholder="type a message..." class="flex-1 bg-transparent text-gray-100 px-0 py-2 text-sm focus:outline-none placeholder-gray-600" />
+            
+            <!-- PAPERCLIP ON THE RIGHT -->
+            <button type="button" @click="showPasteModal = true" class="text-gray-400 hover:text-cyan-400 text-lg px-2 transition-colors flex-shrink-0" title="Attach file or paste">
+              📎
+            </button>
+            
+            <button type="submit" :disabled="!input.trim() || sending" class="px-4 py-1.5 rounded-md bg-emerald-600 hover:bg-emerald-500 text-gray-950 font-bold text-sm transition-colors disabled:bg-gray-800 disabled:text-gray-600">send</button>
+          </div>
+        </form>
+      </div>
+    </template>
+
+    <!-- Error -->
+    <div v-if="error && !needsUnlock && !needsInvite" class="px-4 sm:px-6 py-8 text-center">
+      <ErrorBanner :message="error" />
+      <button @click="router.push('/rooms')" class="text-xs text-emerald-400 hover:underline mt-2">&lt; back to rooms</button>
+    </div>
+
+    <LoadingSpinner v-if="initialLoading" label="loading..." />
 
     <!-- Paste creation modal -->
     <div v-if="showPasteModal" class="fixed inset-0 z-50 bg-black/70 flex items-center justify-center p-4" @click.self="closePasteModal">
       <div class="bg-gray-900 border border-gray-800 rounded-lg w-full max-w-lg p-5 font-mono">
         <div class="flex items-center justify-between mb-4">
-          <div class="text-sm text-white"><span class="text-cyan-400">📋</span> new paste</div>
+          <div class="text-sm text-white"><span class="text-cyan-400">📋</span> new secure paste</div>
           <button @click="closePasteModal" class="text-gray-500 hover:text-white">✕</button>
         </div>
 
@@ -1188,15 +1358,15 @@ onBeforeUnmount(() => {
 
         <div v-if="pasteMode === 'text'" class="mb-3">
           <textarea v-model="pasteText" rows="8" placeholder="paste your text here..." class="w-full bg-gray-950 border border-gray-800 text-gray-100 px-3 py-2 rounded-md text-sm font-mono focus:outline-none focus:border-cyan-500 resize-none placeholder-gray-600"></textarea>
-          <div class="text-[10px] text-gray-600 mt-1">max 1 MB</div>
+          <div class="text-[10px] text-gray-600 mt-1">max {{ Math.round(maxPasteSize / 1024 / 1024) }} MB</div>
         </div>
 
         <div v-else class="mb-3">
           <input type="file" @change="onPasteFile" class="w-full text-xs text-gray-400 file:mr-2 file:py-1.5 file:px-3 file:rounded-md file:border-0 file:bg-gray-800 file:text-cyan-400 file:font-mono file:cursor-pointer hover:file:bg-gray-700" />
-          <div class="text-[10px] text-gray-600 mt-1">max 50 MB</div>
+          <div class="text-[10px] text-gray-600 mt-1">max {{ Math.round(maxPasteSize / 1024 / 1024) }} MB</div>
         </div>
 
-        <div v-if="pasteSubmitting && pasteMode === 'file'" class="mb-3">
+        <div v-if="pasteSubmitting" class="mb-3">
           <div class="h-1 bg-gray-800 rounded overflow-hidden">
             <div class="h-full bg-cyan-500 transition-all" :style="{ width: pasteProgress + '%' }"></div>
           </div>
@@ -1208,7 +1378,7 @@ onBeforeUnmount(() => {
         <div class="flex justify-end gap-2">
           <button @click="closePasteModal" class="px-3 py-1.5 rounded-md text-gray-400 hover:text-white text-xs">cancel</button>
           <button @click="submitPaste" :disabled="pasteSubmitting" class="px-4 py-1.5 rounded-md bg-cyan-600 hover:bg-cyan-500 text-gray-950 font-bold text-xs transition-colors disabled:bg-gray-700 disabled:text-gray-500">
-            {{ pasteSubmitting ? '...' : '> create paste' }}
+            {{ pasteSubmitting ? '...' : '> encrypt & create' }}
           </button>
         </div>
       </div>
@@ -1221,7 +1391,6 @@ onBeforeUnmount(() => {
           <div class="text-sm text-white flex items-center gap-2 min-w-0">
             <span class="text-cyan-400">📋</span>
             <span class="truncate">{{ openPasteTitle }}</span>
-            <span v-if="openPastePeek" class="text-[10px] text-gray-500">(peek)</span>
           </div>
           <button @click="closeOpenPasteModal" class="text-gray-500 hover:text-white flex-shrink-0">✕</button>
         </div>
@@ -1261,35 +1430,72 @@ onBeforeUnmount(() => {
           </div>
           <div class="flex gap-2">
             <button @click="closeOpenPasteModal" class="px-3 py-1.5 rounded-md text-gray-400 hover:text-white text-xs">close</button>
-            <button
-              v-if="!openPastePeek"
-              @click="donePaste({ paste_hash: openPasteHash }); closeOpenPasteModal()"
-              class="px-4 py-1.5 rounded-md bg-emerald-600 hover:bg-emerald-500 text-gray-950 font-bold text-xs"
-            >done — delete forever</button>
           </div>
         </div>
       </div>
     </div>
 
-    <!-- Report modal -->
-    <div v-if="showReportModal" class="fixed inset-0 z-50 bg-black/70 flex items-center justify-center p-4" @click.self="closeReportModal">
-      <div class="bg-gray-900 border border-yellow-500/40 rounded-lg w-full max-w-md p-5 font-mono">
-        <div class="flex items-center justify-between mb-4">
-          <div class="text-sm text-white"><span class="text-yellow-400">⚑</span> report message</div>
-          <button @click="closeReportModal" class="text-gray-500 hover:text-white">✕</button>
-        </div>
-        <div class="mb-3">
-          <div class="text-xs text-gray-500 mb-1">reason (optional)</div>
-          <textarea v-model="reportReason" rows="4" placeholder="what's wrong with this message?" class="w-full bg-gray-950 border border-gray-800 text-gray-100 px-3 py-2 rounded-md text-sm font-mono focus:outline-none focus:border-yellow-500 resize-none placeholder-gray-600"></textarea>
-        </div>
-        <p v-if="reportError" class="text-xs text-red-400 mb-2">{{ reportError }}</p>
-        <div class="flex justify-end gap-2">
-          <button @click="closeReportModal" class="px-3 py-1.5 rounded-md text-gray-400 hover:text-white text-xs">cancel</button>
-          <button @click="submitReport" :disabled="reportSubmitting" class="px-4 py-1.5 rounded-md bg-yellow-600 hover:bg-yellow-500 text-gray-950 font-bold text-xs transition-colors disabled:bg-gray-700 disabled:text-gray-500">
-            {{ reportSubmitting ? '...' : '> report' }}
-          </button>
+    <!-- Manage members slide-over -->
+    <teleport to="body">
+      <div v-if="showManage" class="fixed inset-0 z-50 flex font-mono">
+        <div class="flex-1 bg-black/50" @click="closeManage"></div>
+        <div class="w-full max-w-md h-full bg-gray-900 border-l border-gray-800 flex flex-col">
+          <div class="h-14 flex items-center justify-between px-4 border-b border-gray-800 flex-shrink-0">
+            <div class="text-sm text-white">
+              <span class="text-red-400">!</span> manage members
+            </div>
+            <button @click="closeManage" class="text-gray-500 hover:text-white">✕</button>
+          </div>
+
+          <div class="p-4 border-b border-gray-800 flex-shrink-0">
+            <input
+              v-model="manageQuery"
+              @input="onManageInput"
+              placeholder="search username to remove"
+              autocomplete="off"
+              class="w-full bg-gray-950 border border-gray-800 text-emerald-300 px-3 py-2 rounded-md text-sm focus:outline-none focus:border-emerald-500 placeholder-gray-600"
+            />
+            <p class="text-[10px] text-gray-600 mt-1">// type to search, click ✕ to remove from room</p>
+            <p v-if="manageError" class="text-xs text-red-400 mt-2">{{ manageError }}</p>
+          </div>
+
+          <div class="flex-1 overflow-y-auto p-4">
+            <div v-if="manageSearching" class="text-xs text-gray-500">searching...</div>
+            <div v-else-if="!manageQuery.trim()" class="text-xs text-gray-600">
+              // start typing to search members
+            </div>
+            <div v-else-if="!manageResults.length" class="text-xs text-gray-600">
+              // no matches
+            </div>
+            <ul v-else class="space-y-1">
+              <li
+                v-for="m in manageResults"
+                :key="m.user_id"
+                class="flex items-center gap-2 bg-gray-950 border border-gray-800 rounded-md px-3 py-2"
+              >
+                <span class="w-7 h-7 rounded-full bg-gray-800 flex items-center justify-center text-[10px] text-emerald-400 font-bold flex-shrink-0">
+                  {{ m.username.slice(0,2).toUpperCase() }}
+                </span>
+                <div class="min-w-0 flex-1">
+                  <div class="text-sm text-gray-200 truncate">{{ m.username }}</div>
+                  <div class="text-[10px] text-gray-600">[{{ m.role }}]</div>
+                </div>
+                <button
+                  v-if="m.role !== 'owner' && m.user_id !== myId"
+                  @click="removeMember(m)"
+                  :disabled="manageLoading"
+                  class="text-xs text-red-400 hover:text-red-300 disabled:text-gray-600 flex-shrink-0"
+                >
+                  ✕ remove
+                </button>
+                <span v-else class="text-[10px] text-gray-600 flex-shrink-0">
+                  {{ m.role === 'owner' ? 'owner' : 'you' }}
+                </span>
+              </li>
+            </ul>
+          </div>
         </div>
       </div>
-    </div>
+    </teleport>
   </div>
 </template>

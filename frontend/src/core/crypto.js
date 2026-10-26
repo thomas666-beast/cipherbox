@@ -6,9 +6,13 @@ function b64ToBytes(b64) {
 }
 
 function bytesToB64(bytes) {
-  let bin = ''
-  for (let i = 0; i < bytes.length; i++) bin += String.fromCharCode(bytes[i])
-  return btoa(bin)
+  let binary = ''
+  const chunkSize = 8192
+  for (let i = 0; i < bytes.length; i += chunkSize) {
+    const chunk = bytes.subarray(i, i + chunkSize)
+    binary += String.fromCharCode.apply(null, chunk)
+  }
+  return btoa(binary)
 }
 
 async function importKey(b64Key) {
@@ -22,6 +26,16 @@ async function importKey(b64Key) {
   )
 }
 
+export async function generateAesKey() {
+  const key = await crypto.subtle.generateKey(
+    { name: 'AES-GCM', length: 256 },
+    true,
+    ['encrypt', 'decrypt']
+  )
+  const exported = await crypto.subtle.exportKey('raw', key)
+  return bytesToB64(new Uint8Array(exported))
+}
+
 export async function encryptMessage(b64Key, plaintext) {
   const key = await importKey(b64Key)
   const iv = crypto.getRandomValues(new Uint8Array(12))
@@ -30,7 +44,6 @@ export async function encryptMessage(b64Key, plaintext) {
     key,
     new TextEncoder().encode(plaintext)
   )
-  // Web Crypto appends a 16-byte tag to the ciphertext; split it out
   const ctBytes = new Uint8Array(ct)
   const tag = ctBytes.slice(ctBytes.length - 16)
   const payload = ctBytes.slice(0, ctBytes.length - 16)
@@ -46,7 +59,6 @@ export async function decryptMessage(b64Key, ctB64, ivB64, tagB64) {
   const iv = b64ToBytes(ivB64)
   const ct = b64ToBytes(ctB64)
   const tag = b64ToBytes(tagB64)
-  // Reassemble: ciphertext || tag (Web Crypto expects the tag appended)
   const combined = new Uint8Array(ct.length + tag.length)
   combined.set(ct, 0)
   combined.set(tag, ct.length)
@@ -56,4 +68,21 @@ export async function decryptMessage(b64Key, ctB64, ivB64, tagB64) {
     combined
   )
   return new TextDecoder().decode(pt)
+}
+
+// NEW: Decrypt raw bytes (for files)
+export async function decryptBytes(b64Key, ctB64, ivB64, tagB64) {
+  const key = await importKey(b64Key)
+  const iv = b64ToBytes(ivB64)
+  const ct = b64ToBytes(ctB64)
+  const tag = b64ToBytes(tagB64)
+  const combined = new Uint8Array(ct.length + tag.length)
+  combined.set(ct, 0)
+  combined.set(tag, ct.length)
+  const pt = await crypto.subtle.decrypt(
+    { name: 'AES-GCM', iv },
+    key,
+    combined
+  )
+  return new Uint8Array(pt)
 }

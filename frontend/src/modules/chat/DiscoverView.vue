@@ -96,7 +96,7 @@ async function join(room) {
   joining.value = room.public_hash
   try {
     await api.post(`/rooms/${room.public_hash}/join`)
-    // Remove from discover list — we're now a member
+    // Remove from discover list since we're now a member
     rooms.value = rooms.value.filter(r => r.public_hash !== room.public_hash)
     total.value = Math.max(0, total.value - 1)
     router.push(`/rooms/${room.public_hash}`)
@@ -121,18 +121,21 @@ onMounted(loadFirst)
           // {{ query ? `${total} match${total === 1 ? '' : 'es'}` : `${total} public room${total === 1 ? '' : 's'}` }}
         </p>
       </div>
+      <button @click="router.push('/rooms')" class="px-3 py-1.5 rounded-md bg-gray-800 hover:bg-gray-700 text-gray-300 text-xs font-bold transition-colors">
+        &lt; back to rooms
+      </button>
     </div>
 
     <input
       v-model="query"
-      placeholder="search rooms by name"
+      placeholder="search public channels by name"
       autocomplete="off"
       class="w-full mb-4 bg-gray-950 border border-gray-800 text-emerald-300 px-3 py-2 rounded-md text-sm focus:outline-none focus:border-emerald-500 focus:ring-1 focus:ring-emerald-500/50 placeholder-gray-600"
     />
 
     <ErrorBanner v-if="error" :message="error" />
 
-    <LoadingSpinner v-if="loading" label="loading discoverable rooms..." />
+    <LoadingSpinner v-if="loading" label="loading public rooms..." />
 
     <div
       v-else-if="!error"
@@ -170,7 +173,7 @@ onMounted(loadFirst)
       </ul>
       <EmptyState
         v-else
-        title="no rooms to discover"
+        title="no public rooms found"
         :hint="query ? 'try a different search' : 'nothing public right now'"
       />
     </div>
