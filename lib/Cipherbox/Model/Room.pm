@@ -106,7 +106,7 @@ sub list_members ($self, $room_id, $limit = 100, $offset = 0, $q = undef) {
              FROM room_members rm
              JOIN users u ON u.id = rm.user_id
              WHERE rm.room_id = ? AND u.username ILIKE ?
-             ORDER BY rm.joined_at
+             ORDER BY rm.joined_at, rm.user_id
              LIMIT ? OFFSET ?',
             $room_id, $like, $limit, $offset,
         )->hashes->to_array;
@@ -117,7 +117,7 @@ sub list_members ($self, $room_id, $limit = 100, $offset = 0, $q = undef) {
          FROM room_members rm
          JOIN users u ON u.id = rm.user_id
          WHERE rm.room_id = ?
-         ORDER BY rm.joined_at
+         ORDER BY rm.joined_at, rm.user_id
          LIMIT ? OFFSET ?',
         $room_id, $limit, $offset,
     )->hashes->to_array;
@@ -138,35 +138,46 @@ sub count_members ($self, $room_id, $q = undef) {
     )->array->[0];
 }
 
-sub list_for_user ($self, $user_id) {
+sub list_for_user ($self, $user_id, $limit, $filter, $activity = undef, $cursor_id = undef) {
+    my $type_where = $filter eq 'all' ? '' : 'AND r.type = ?';
+    my @type = $filter eq 'all' ? () : ($filter);
+    my $cursor_where = defined($activity)
+        ? q{WHERE (activity_us, id) < (?::bigint, ?::bigint)} : '';
+    my @cursor = defined($activity) ? ($activity, $cursor_id) : ();
     return $self->pg->db->query(
-        q{
-            WITH last AS (
-                SELECT m.room_id, m.id, m.created_at, u.username AS sender
-                FROM messages m
-                JOIN users u ON u.id = m.sender_id
-                WHERE m.id IN (SELECT max(id) FROM messages GROUP BY room_id)
+        qq{
+            WITH candidates AS (
+                SELECT r.id, r.public_hash, r.name, r.type, r.owner_id, r.created_at,
+                       r.is_invite_only, rm.role AS my_role, rm.last_read_at,
+                       last.id AS last_message_id, last.created_at AS last_message_at,
+                       last.sender_id AS last_sender_id,
+                       (extract(epoch FROM COALESCE(last.created_at, r.created_at)) * 1000000)::bigint AS activity_us
+                FROM room_members rm
+                JOIN rooms r ON r.id = rm.room_id
+                LEFT JOIN LATERAL (
+                    SELECT id, created_at, sender_id FROM messages
+                    WHERE room_id = r.id ORDER BY id DESC LIMIT 1
+                ) last ON true
+                WHERE rm.user_id = ? $type_where
+                  AND NOT EXISTS (
+                      SELECT 1 FROM room_bans rb WHERE rb.room_id = r.id AND rb.user_id = rm.user_id
+                  )
+            ), page AS MATERIALIZED (
+                SELECT * FROM candidates $cursor_where
+                ORDER BY activity_us DESC, id DESC LIMIT ?
             )
-            SELECT r.id, r.public_hash, r.name, r.type, r.owner_id, r.created_at, r.is_invite_only,
-                   rm.role AS my_role,
-                   rm.last_read_at,
-                   (SELECT count(*) FROM room_members rm2 WHERE rm2.room_id = r.id) AS member_count,
-                   last.id           AS last_message_id,
-                   last.created_at   AS last_message_at,
-                   last.sender       AS last_sender,
+            SELECT page.*, u.username AS last_sender,
+                   (SELECT count(*) FROM room_members rm2 WHERE rm2.room_id = page.id) AS member_count,
                    (SELECT count(*) FROM messages m2
-                    WHERE m2.room_id = r.id
+                    WHERE m2.room_id = page.id
                       AND m2.sender_id != ?
-                      AND m2.created_at > rm.last_read_at
+                      AND m2.created_at > page.last_read_at
                       AND m2.deleted_at IS NULL) AS unread_count
-            FROM rooms r
-            JOIN room_members rm ON rm.room_id = r.id
-            LEFT JOIN last ON last.room_id = r.id
-            WHERE rm.user_id = ?
-              AND NOT EXISTS (SELECT 1 FROM room_bans rb WHERE rb.room_id = r.id AND rb.user_id = ?)
-            ORDER BY COALESCE(last.created_at, r.created_at) DESC
+            FROM page
+            LEFT JOIN users u ON u.id = page.last_sender_id
+            ORDER BY page.activity_us DESC, page.id DESC
         },
-        $user_id, $user_id, $user_id,
+        $user_id, @type, @cursor, $limit, $user_id,
     )->hashes->to_array;
 }
 
@@ -331,7 +342,7 @@ sub discover ($self, $user_id, $limit = 100, $offset = 0, $q = undef) {
            AND NOT EXISTS (SELECT 1 FROM room_members rm WHERE rm.room_id = r.id AND rm.user_id = ?)
            AND NOT EXISTS (SELECT 1 FROM room_bans rb WHERE rb.room_id = r.id AND rb.user_id = ?)
            $name_clause
-         ORDER BY r.created_at DESC
+         ORDER BY r.created_at DESC, r.id DESC
          LIMIT ? OFFSET ?",
         @bind,
     )->hashes->to_array;

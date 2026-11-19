@@ -1,5 +1,5 @@
 <script setup>
-import { ref, onMounted, computed } from 'vue'
+import { ref, onMounted, onUnmounted, watch } from 'vue'
 import { useRouter } from 'vue-router'
 import api from '../../core/api'
 import { useAuthStore } from '../../core/auth'
@@ -25,11 +25,7 @@ const dmError = ref('')
 const dmLoading = ref(false)
 const dmCreating = ref(false)
 
-const filteredRooms = computed(() => {
-  const list = store.rooms
-  if (filter.value === 'all') return list
-  return list.filter((r) => r.type === filter.value)
-})
+watch(filter, value => store.load(value))
 
 async function create() {
   if (!newName.value) return
@@ -113,9 +109,11 @@ function timeAgo(ts) {
 }
 
 onMounted(async () => {
+  store.setActive(true)
   store.subscribe()
-  await store.load()
+  await store.load(filter.value)
 })
+onUnmounted(() => store.setActive(false))
 </script>
 
 <template>
@@ -126,7 +124,7 @@ onMounted(async () => {
           <span class="text-emerald-400">&gt;</span> rooms
         </h2>
         <p class="text-xs text-gray-500 mt-1">
-          // {{ store.rooms.length }} room{{ store.rooms.length === 1 ? '' : 's' }}
+          // {{ store.rooms.length }} room{{ store.rooms.length === 1 ? '' : 's' }} loaded
         </p>
       </div>
       <button
@@ -218,8 +216,8 @@ onMounted(async () => {
 
     <LoadingSpinner v-if="store.loading" label="loading rooms..." />
     <template v-else>
-      <ul v-if="filteredRooms.length" class="space-y-2">
-        <li v-for="r in filteredRooms" :key="r.id">
+      <ul v-if="store.rooms.length" class="space-y-2">
+        <li v-for="r in store.rooms" :key="r.id">
           <router-link
             :to="`/rooms/${r.public_hash}`"
             class="block bg-gray-900 border border-gray-800 hover:border-emerald-500/40 rounded-lg px-4 py-3 transition-colors group"
@@ -261,6 +259,9 @@ onMounted(async () => {
         title="no rooms found"
         :hint="filter === 'all' ? 'create one above, get invited, or check /discover' : 'try a different filter'"
       />
+      <button v-if="store.nextCursor" type="button" :disabled="store.loadingMore"
+        class="mt-4 text-sm text-emerald-400 hover:text-emerald-300 disabled:opacity-50"
+        @click="store.loadMore()">{{ store.loadingMore ? 'loading…' : 'load more rooms' }}</button>
     </template>
   </div>
 </template>

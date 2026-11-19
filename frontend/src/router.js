@@ -9,11 +9,9 @@ const routes = [
   { path: '/discover', component: () => import('./modules/chat/DiscoverView.vue'), meta: { requiresAuth: true } },
   { path: '/rooms/:hash', component: () => import('./modules/chat/RoomView.vue'), meta: { requiresAuth: true } },
   { path: '/library', component: () => import('./modules/library/LibraryView.vue'), meta: { requiresAuth: true } },
-  { path: '/library/category/:hash', component: () => import('./modules/library/CategoryView.vue'), meta: { requiresAuth: true } },
+  { path: '/library/category/:hash', component: () => import('./modules/library/LibraryView.vue'), meta: { requiresAuth: true } },
   { path: '/admin', component: () => import('./modules/admin/AdminView.vue'), meta: { requiresAuth: true, requiresAdmin: true } },
   { path: '/rooms/:hash/members', component: () => import('./modules/chat/MembersView.vue'), meta: { requiresAuth: true } },
-  { path: '/library', component: () => import('./modules/library/LibraryView.vue'), meta: { requiresAuth: true } },
-  { path: '/library/category/:hash', component: () => import('./modules/library/LibraryView.vue'), meta: { requiresAuth: true } }
 ]
 
 const router = createRouter({

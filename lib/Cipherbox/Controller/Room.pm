@@ -1,5 +1,6 @@
 package Cipherbox::Controller::Room;
 use Mojo::Base 'Mojolicious::Controller', -signatures;
+use Cipherbox::Page qw(page_limit page_offset id_cursor);
 
 sub _resolve_room ($self, $param) {
     return $self->rooms->find_by_hash_or_id($param);
@@ -7,8 +8,26 @@ sub _resolve_room ($self, $param) {
 
 sub list ($self) {
     my $user  = $self->current_user;
-    my $rooms = $self->rooms->list_for_user($user->{id});
-    $self->render(json => { rooms => $rooms });
+    my $cfg = $self->pagination;
+    my $limit = page_limit($self->param('limit'), $cfg->{default_limit}, $cfg->{max_limit});
+    my $filter = $self->param('type') // 'all';
+    my ($activity, $id);
+    if (defined(my $cursor = $self->param('cursor'))) {
+        ($activity, $id) = $cursor =~ /\A(-?[0-9]{1,18}):([0-9]{1,19})\z/;
+        return $self->render(json => { error => 'invalid room cursor' }, status => 400)
+            unless defined($activity) && id_cursor($id);
+    }
+    return $self->render(json => { error => 'invalid room pagination or type' }, status => 400)
+        unless defined($limit) && $filter =~ /\A(?:all|room|channel|private)\z/;
+
+    my $rooms = $self->rooms->list_for_user($user->{id}, $limit + 1, $filter, $activity, $id);
+    my $next;
+    if (@$rooms > $limit) {
+        pop @$rooms;
+        $next = "$rooms->[-1]{activity_us}:$rooms->[-1]{id}";
+    }
+    delete @{$_}{qw(activity_us last_sender_id)} for @$rooms;
+    $self->render(json => { rooms => $rooms, next_cursor => $next });
 }
 
 sub create ($self) {
@@ -252,16 +271,23 @@ sub messages ($self) {
         if $self->rooms->is_banned($room->{id}, $user->{id});
 
     my $before = $self->param('before');
-    my $limit  = $self->param('limit');
     my $cfg    = $self->pagination;
+    my $limit = page_limit($self->param('limit'), $cfg->{default_limit}, $cfg->{max_limit});
+    return $self->render(json => { error => 'invalid message pagination' }, status => 400)
+        unless defined($limit) && (!defined($before) || id_cursor($before));
 
     my $msgs = $self->rooms->list_messages(
-        $room->{id}, $before, $limit,
-        $cfg->{max_limit}, $cfg->{default_limit},
+        $room->{id}, $before, $limit + 1, $cfg->{max_limit} + 1,
     );
+    my $next;
+    if (@$msgs > $limit) {
+        pop @$msgs;
+        $next = "$msgs->[-1]{id}";
+    }
     my @ordered = reverse @$msgs;
 
     $self->render(json => {
+        next_cursor => $next,
         messages => [
             map {
                 {
@@ -288,13 +314,12 @@ sub members ($self) {
     return $self->render(json => { error => 'forbidden' }, status => 403)
         unless $self->rooms->is_member($room->{id}, $user->{id});
 
-    my $limit  = $self->param('limit') // 100;
-    my $offset = $self->param('offset') // 0;
+    my $limit  = page_limit($self->param('limit'), 100, 200);
+    my $offset = page_offset($self->param('offset'));
     my $q      = $self->param('q');
 
-    $limit = 200 if $limit > 200;
-    $limit = 1 if $limit < 1;
-    $offset = 0 if $offset < 0;
+    return $self->render(json => { error => 'invalid member pagination' }, status => 400)
+        unless defined($limit) && defined($offset);
 
     my $members = $self->rooms->list_members($room->{id}, $limit, $offset, $q);
     my $total   = $self->rooms->count_members($room->{id}, $q);
@@ -478,13 +503,12 @@ sub discover ($self) {
     my $user = $self->current_user;
     my $cfg  = $self->pagination;
 
-    my $limit  = $self->param('limit')  // $cfg->{default_limit};
-    my $offset = $self->param('offset') // 0;
+    my $limit = page_limit($self->param('limit'), $cfg->{default_limit}, $cfg->{max_limit});
+    my $offset = page_offset($self->param('offset'));
     my $q      = $self->param('q');
 
-    $limit = $cfg->{max_limit} if $limit > $cfg->{max_limit};
-    $limit = 1 if $limit < 1;
-    $offset = 0 if $offset < 0;
+    return $self->render(json => { error => 'invalid discovery pagination' }, status => 400)
+        unless defined($limit) && defined($offset);
 
     my ($rooms, $total);
     eval {

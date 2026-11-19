@@ -7,11 +7,13 @@ function b64ToBytes(b64) {
 
 function bytesToB64(bytes) {
   let bin = ''
-  for (let i = 0; i < bytes.length; i++) bin += String.fromCharCode(bytes[i])
+  for (let i = 0; i < bytes.length; i += 8192) {
+    bin += String.fromCharCode(...bytes.subarray(i, i + 8192))
+  }
   return btoa(bin)
 }
 
-async function importKey(b64Key) {
+export async function importRoomKey(b64Key) {
   const raw = b64ToBytes(b64Key)
   return crypto.subtle.importKey(
     'raw',
@@ -23,7 +25,7 @@ async function importKey(b64Key) {
 }
 
 export async function encryptMessage(b64Key, plaintext) {
-  const key = await importKey(b64Key)
+  const key = typeof b64Key === 'string' ? await importRoomKey(b64Key) : b64Key
   const iv = crypto.getRandomValues(new Uint8Array(12))
   const ct = await crypto.subtle.encrypt(
     { name: 'AES-GCM', iv },
@@ -42,7 +44,7 @@ export async function encryptMessage(b64Key, plaintext) {
 }
 
 export async function decryptMessage(b64Key, ctB64, ivB64, tagB64) {
-  const key = await importKey(b64Key)
+  const key = typeof b64Key === 'string' ? await importRoomKey(b64Key) : b64Key
   const iv = b64ToBytes(ivB64)
   const ct = b64ToBytes(ctB64)
   const tag = b64ToBytes(tagB64)

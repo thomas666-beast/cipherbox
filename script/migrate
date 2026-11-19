@@ -7,7 +7,7 @@ use Mojo::File 'path';
 
 my $env = $ENV{CIPHERBOX_ENV} // 'development';
 
-my $root      = path(__FILE__)->dirname->dirname;
+my $root      = path(__FILE__)->to_abs->dirname->dirname;
 my $conf_file = $root->child('cipherbox.conf');
 
 my $config = do $conf_file->to_string;
@@ -19,7 +19,7 @@ my $dsn = $env eq 'test'
     : $config->{pg}{dsn};
 
 die "No DSN for env=$env\n" unless $dsn;
-print "Using DSN: $dsn\n";
+print "Applying migrations to the $env database\n";
 
 my $pg = Mojo::Pg->new($dsn);
 my $db = $pg->db;
@@ -47,9 +47,10 @@ for my $file (@files) {
     }
     print "Applying $name...\n";
     my $sql = $file->slurp;
-    eval { $db->query($sql); 1 }
-        or die "Failed: $@";
+    my $tx = $db->begin;
+    $db->query($sql);
     $db->query('INSERT INTO schema_migrations (filename) VALUES (?)', $name);
+    $tx->commit;
     print "  OK\n";
     $count++;
 }

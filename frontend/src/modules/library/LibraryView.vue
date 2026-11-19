@@ -9,13 +9,13 @@ const TreeNode = defineComponent({
     selected: { type: String, default: null },
     expanded: { type: Object, default: () => ({}) },
   },
-  emits: ['select', 'toggle'],
+  emits: ['select', 'toggle', 'more'],
   setup(props, { emit }) {
     const typeIcon = (t) => t === 'audio' ? '♪' : t === 'video' ? '▶' : '▤'
     const typeColor = (t) => t === 'audio' ? 'text-yellow-400' : t === 'video' ? 'text-red-400' : 'text-cyan-400'
 
     return () => {
-      const hasChildren = props.node.children && props.node.children.length > 0
+      const hasChildren = props.node.has_children
       const isExpanded = !!props.expanded[props.node.public_hash]
       const isSelected = props.selected === props.node.public_hash
 
@@ -29,6 +29,8 @@ const TreeNode = defineComponent({
         hasChildren
           ? h('button', {
               class: 'text-xs text-gray-500 w-4 flex-shrink-0',
+              'aria-label': `${isExpanded ? 'Collapse' : 'Expand'} ${props.node.name}`,
+              'aria-expanded': isExpanded,
               onClick: (e) => { e.stopPropagation(); emit('toggle', props.node) },
             }, isExpanded ? '▾' : '▸')
           : h('span', { class: 'w-4 flex-shrink-0' }),
@@ -45,7 +47,7 @@ const TreeNode = defineComponent({
       ])
 
       const children = hasChildren && isExpanded
-        ? props.node.children.map((child) =>
+        ? (props.node.children || []).map((child) =>
             h(TreeNode, {
               key: child.id,
               node: child,
@@ -54,10 +56,19 @@ const TreeNode = defineComponent({
               expanded: props.expanded,
               onSelect: (hash) => emit('select', hash),
               onToggle: (n) => emit('toggle', n),
+              onMore: (n) => emit('more', n),
             }))
         : []
 
-      return h('div', {}, [row, ...children])
+      const more = isExpanded && props.node.next_offset != null
+        ? h('button', {
+            type: 'button',
+            class: 'ml-4 text-xs text-emerald-400 disabled:opacity-50',
+            disabled: props.node.loading,
+            onClick: () => emit('more', props.node),
+          }, 'load more in branch')
+        : null
+      return h('div', {}, [row, ...children, more])
     }
   },
 })
@@ -69,7 +80,7 @@ export default {
 </script>
 
 <script setup>
-import { ref, onMounted, computed } from 'vue'
+import { ref, onMounted } from 'vue'
 import { useRoute, useRouter } from 'vue-router'
 import api from '../../core/api'
 import { useAuthStore } from '../../core/auth'
@@ -85,6 +96,12 @@ const tree = ref([])
 const treeLoading = ref(true)
 const treeError = ref('')
 const expandedNodes = ref({})
+const PAGE = 30
+const rootNext = ref(null)
+const subNext = ref(null)
+const itemNext = ref(null)
+const loadingList = ref('')
+let contentRevision = 0
 
 // Read the hash directly from the URL on mount
 const selectedHash = ref(route.params.hash || null)
@@ -94,6 +111,7 @@ const subcategories = ref([])
 const items = ref([])
 const contentLoading = ref(false)
 const contentError = ref('')
+const breadcrumb = ref([])
 
 const newName = ref('')
 const newType = ref('book')
@@ -108,48 +126,32 @@ const uploading = ref(false)
 const editingItemId = ref(null)
 const editingTitle = ref('')
 
-const breadcrumb = computed(() => {
-  if (!selectedHash.value) return []
-  const path = []
-  const walk = (nodes, trail) => {
-    for (const node of nodes) {
-      const t = [...trail, node]
-      if (node.public_hash === selectedHash.value) {
-        path.push(...t)
-        return true
-      }
-      if (node.children && walk(node.children, t)) return true
-    }
-    return false
-  }
-  walk(tree.value, [])
-  return path
-})
-
-function expandAncestorsOf(hash) {
-  if (!hash) return
-  const trail = []
-  const walk = (nodes) => {
-    for (const node of nodes) {
-      if (node.public_hash === hash) return true
-      trail.push(node.public_hash)
-      if (node.children && walk(node.children)) return true
-      trail.pop()
-    }
-    return false
-  }
-  walk(tree.value)
-  for (const h of trail) {
-    expandedNodes.value[h] = true
-  }
+function categoriesPage(parent, offset = 0) {
+  return api.get('/library/categories', {
+    params: { limit: PAGE, offset, parent_id: parent || undefined },
+  }).then(res => res.data)
 }
 
-async function loadTree() {
+function itemsPage(offset = 0) {
+  return api.get(`/library/categories/${selectedHash.value}/items`, {
+    params: { limit: PAGE, offset },
+  }).then(res => res.data)
+}
+
+function appendUnique(current, rows) {
+  const seen = new Set(current.map(row => row.id))
+  return [...current, ...rows.filter(row => !seen.has(row.id))]
+}
+
+async function loadTree(append = false) {
+  if (append && (treeLoading.value || rootNext.value == null)) return
   treeLoading.value = true
   treeError.value = ''
   try {
-    const res = await api.get('/library/tree')
-    tree.value = res.data.tree
+    const page = await categoriesPage(null, append ? rootNext.value : 0)
+    if (!append) expandedNodes.value = {}
+    tree.value = append ? appendUnique(tree.value, page.categories) : page.categories
+    rootNext.value = page.next_offset
   } catch (e) {
     treeError.value = e.response?.data?.error || 'Failed to load library'
   } finally {
@@ -158,6 +160,8 @@ async function loadTree() {
 }
 
 async function loadContent() {
+  const revision = ++contentRevision
+  loadingList.value = ''
   if (!selectedHash.value) {
     category.value = null
     subcategories.value = []
@@ -167,23 +171,67 @@ async function loadContent() {
   contentLoading.value = true
   contentError.value = ''
   try {
-    const catRes = await api.get(`/library/categories/${selectedHash.value}`)
-    category.value = catRes.data.category
-
-    const subsRes = await api.get('/library/categories', { params: { parent_id: selectedHash.value } })
-    subcategories.value = subsRes.data.categories
-
-    const itemsRes = await api.get(`/library/categories/${selectedHash.value}/items`)
-    items.value = itemsRes.data.items
+    const [cat, subs, files] = await Promise.all([
+      api.get(`/library/categories/${selectedHash.value}`),
+      categoriesPage(selectedHash.value),
+      itemsPage(),
+    ])
+    if (revision !== contentRevision) return
+    category.value = cat.data.category
+    breadcrumb.value = cat.data.path
+    subcategories.value = subs.categories
+    subNext.value = subs.next_offset
+    items.value = files.items
+    itemNext.value = files.next_offset
   } catch (e) {
-    contentError.value = e.response?.data?.error || 'Failed to load category'
+    if (revision === contentRevision) contentError.value = e.response?.data?.error || 'Failed to load category'
   } finally {
-    contentLoading.value = false
+    if (revision === contentRevision) contentLoading.value = false
+  }
+}
+
+async function loadBranch(node) {
+  if (node.loading || (node.children && node.next_offset == null)) return
+  node.loading = true
+  treeError.value = ''
+  try {
+    const page = await categoriesPage(node.public_hash, node.next_offset ?? 0)
+    node.children = appendUnique(node.children ?? [], page.categories)
+    node.next_offset = page.next_offset
+  } catch (e) {
+    treeError.value = e.response?.data?.error || 'Failed to load branch'
+  } finally {
+    node.loading = false
   }
 }
 
 function toggleNode(node) {
   expandedNodes.value[node.public_hash] = !expandedNodes.value[node.public_hash]
+  if (expandedNodes.value[node.public_hash] && !node.children) loadBranch(node)
+}
+
+async function loadMore(kind) {
+  if (loadingList.value || contentLoading.value) return
+  const revision = contentRevision
+  loadingList.value = kind
+  contentError.value = ''
+  try {
+    if (kind === 'items' && itemNext.value != null) {
+      const page = await itemsPage(itemNext.value)
+      if (revision !== contentRevision) return
+      items.value = appendUnique(items.value, page.items)
+      itemNext.value = page.next_offset
+    } else if (kind === 'categories' && subNext.value != null) {
+      const page = await categoriesPage(selectedHash.value, subNext.value)
+      if (revision !== contentRevision) return
+      subcategories.value = appendUnique(subcategories.value, page.categories)
+      subNext.value = page.next_offset
+    }
+  } catch (e) {
+    if (revision === contentRevision) contentError.value = e.response?.data?.error || 'Failed to load more'
+  } finally {
+    if (revision === contentRevision) loadingList.value = ''
+  }
 }
 
 // Just push the URL. App.vue will destroy and recreate this component.
@@ -262,7 +310,7 @@ async function deleteCategory(cat) {
     if (wasInPath) {
       selectCategory(null)
     } else {
-      await loadTree()
+      await Promise.all([loadTree(), loadContent()])
     }
   } catch (e) {
     alert(e.response?.data?.error || 'Delete failed')
@@ -331,13 +379,7 @@ function sizeLabel(bytes) {
   return `${(bytes / 1024 / 1024 / 1024).toFixed(2)} GB`
 }
 
-onMounted(async () => {
-  await loadTree()
-  if (selectedHash.value) {
-    expandAncestorsOf(selectedHash.value)
-  }
-  await loadContent()
-})
+onMounted(() => Promise.all([loadTree(), loadContent()]))
 </script>
 
 <template>
@@ -348,7 +390,7 @@ onMounted(async () => {
           <span class="text-emerald-400">&gt;</span> library
         </h2>
         <p class="text-xs text-gray-500 mt-1">
-          // {{ tree.length }} top-level categor{{ tree.length === 1 ? 'y' : 'ies' }}
+          // {{ tree.length }} top-level categor{{ tree.length === 1 ? 'y' : 'ies' }} loaded
         </p>
       </div>
     </div>
@@ -376,7 +418,10 @@ onMounted(async () => {
             :expanded="expandedNodes"
             @select="selectCategory"
             @toggle="toggleNode"
+            @more="loadBranch"
           />
+          <button v-if="rootNext != null" type="button" class="mt-2 text-xs text-emerald-400"
+            @click="loadTree(true)">load more categories</button>
           <p v-if="!tree.length" class="text-xs text-gray-600 py-2">no categories yet</p>
         </template>
       </aside>
@@ -475,6 +520,9 @@ onMounted(async () => {
                 </div>
               </li>
             </ul>
+            <button v-if="subNext != null" type="button" :disabled="!!loadingList"
+              class="mt-3 text-sm text-emerald-400 disabled:opacity-50"
+              @click="loadMore('categories')">load more subcategories</button>
           </section>
 
           <section>
@@ -512,6 +560,9 @@ onMounted(async () => {
               </li>
             </ul>
             <EmptyState v-else title="no items yet" hint="upload something above" />
+            <button v-if="itemNext != null" type="button" :disabled="!!loadingList"
+              class="mt-3 text-sm text-emerald-400 disabled:opacity-50"
+              @click="loadMore('items')">load more items</button>
           </section>
         </template>
       </section>

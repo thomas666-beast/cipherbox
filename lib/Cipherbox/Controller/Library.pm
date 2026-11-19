@@ -1,5 +1,6 @@
 package Cipherbox::Controller::Library;
 use Mojo::Base 'Mojolicious::Controller', -signatures;
+use Cipherbox::Page qw(page_limit page_offset);
 use Mojo::File 'path';
 use Encode qw(encode);
 use UUID::Tiny qw(create_uuid_as_string UUID_V4);
@@ -36,8 +37,15 @@ sub list_categories ($self) {
             unless $cat;
         $parent_id = $cat->{id};
     }
-    my $list = $self->library->list_categories($parent_id);
-    $self->render(json => { categories => $list });
+    my $cfg = $self->pagination;
+    my $limit = page_limit($self->param('limit'), $cfg->{default_limit}, $cfg->{max_limit});
+    my $offset = page_offset($self->param('offset'));
+    return $self->render(json => { error => 'invalid category pagination' }, status => 400)
+        unless defined($limit) && defined($offset);
+    my $list = $self->library->list_categories($parent_id, $limit + 1, $offset);
+    my $next = @$list > $limit ? $offset + $limit : undef;
+    pop @$list if defined $next;
+    $self->render(json => { categories => $list, next_offset => $next });
 }
 
 sub get_category ($self) {
@@ -45,7 +53,7 @@ sub get_category ($self) {
     my $cat = $self->_resolve_category($param);
     return $self->render(json => { error => 'not found' }, status => 404)
         unless $cat;
-    $self->render(json => { category => $cat });
+    $self->render(json => { category => $cat, path => $self->library->category_path($cat->{id}) });
 }
 
 sub create_category ($self) {
@@ -132,17 +140,19 @@ sub list_items ($self) {
         unless $cat;
 
     my $cfg    = $self->pagination;
-    my $limit  = $self->param('limit')  // $cfg->{default_limit};
-    my $offset = $self->param('offset') // 0;
-    $limit = $cfg->{max_limit} if $limit > $cfg->{max_limit};
-    $limit = 1 if $limit < 1;
-    $offset = 0 if $offset < 0;
+    my $limit  = page_limit($self->param('limit'), $cfg->{default_limit}, $cfg->{max_limit});
+    my $offset = page_offset($self->param('offset'));
+    return $self->render(json => { error => 'invalid item pagination' }, status => 400)
+        unless defined($limit) && defined($offset);
 
-    my $items = $self->library->list_items($cat->{id}, $limit, $offset);
+    my $items = $self->library->list_items($cat->{id}, $limit + 1, $offset);
+    my $next = @$items > $limit ? $offset + $limit : undef;
+    pop @$items if defined $next;
     $self->render(json => {
         items  => $items,
         limit  => $limit,
         offset => $offset,
+        next_offset => $next,
     });
 }
 

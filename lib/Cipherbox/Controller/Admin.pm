@@ -1,14 +1,13 @@
 package Cipherbox::Controller::Admin;
 use Mojo::Base 'Mojolicious::Controller', -signatures;
+use Cipherbox::Page qw(page_limit page_offset id_cursor);
 
 sub list_users ($self) {
     my $cfg    = $self->pagination;
-    my $limit  = $self->param('limit')  // $cfg->{default_limit};
-    my $offset = $self->param('offset') // 0;
-
-    $limit = $cfg->{max_limit} if $limit > $cfg->{max_limit};
-    $limit = 1 if $limit < 1;
-    $offset = 0 if $offset < 0;
+    my $limit  = page_limit($self->param('limit'), $cfg->{default_limit}, $cfg->{max_limit});
+    my $offset = page_offset($self->param('offset'));
+    return $self->render(json => { error => 'invalid user pagination' }, status => 400)
+        unless defined($limit) && defined($offset);
 
     my $users = $self->users->list_all($limit, $offset);
     my $total = $self->users->count;
@@ -118,12 +117,10 @@ sub update_settings ($self) {
 }
 
 sub list_reports ($self) {
-    my $cfg    = $self->pagination;
-    my $limit  = $self->param('limit')  // 50;
-    my $offset = $self->param('offset') // 0;
-    $limit = 100 if $limit > 100;
-    $limit = 1 if $limit < 1;
-    $offset = 0 if $offset < 0;
+    my $limit  = page_limit($self->param('limit'), 50, 100);
+    my $offset = page_offset($self->param('offset'));
+    return $self->render(json => { error => 'invalid report pagination' }, status => 400)
+        unless defined($limit) && defined($offset);
 
     my $reports = $self->reports->list_open($limit, $offset);
     my $total   = $self->reports->count_open;
@@ -256,15 +253,19 @@ sub view_room ($self) {
 
     # Fetch messages
     my $cfg    = $self->pagination;
-    my $limit  = $self->param('limit')  // $cfg->{default_limit};
+    my $limit  = page_limit($self->param('limit'), $cfg->{default_limit}, $cfg->{max_limit});
     my $before = $self->param('before');
-    $limit = $cfg->{max_limit} if $limit > $cfg->{max_limit};
-    $limit = 1 if $limit < 1;
+    return $self->render(json => { error => 'invalid message pagination' }, status => 400)
+        unless defined($limit) && (!defined($before) || id_cursor($before));
 
     my $msgs = $self->rooms->list_messages(
-        $room->{id}, $before, $limit,
-        $cfg->{max_limit}, $cfg->{default_limit},
+        $room->{id}, $before, $limit + 1, $cfg->{max_limit} + 1,
     );
+    my $next;
+    if (@$msgs > $limit) {
+        pop @$msgs;
+        $next = "$msgs->[-1]{id}";
+    }
     my @ordered = reverse @$msgs;
 
     # Decrypt for the admin (they have access via the room key, since they're the platform admin
@@ -335,8 +336,8 @@ sub view_room ($self) {
     }
 
     # Sender names
-    my $members = $self->rooms->list_members($room->{id});
-    my %member_names = map { $_->{user_id} => $_->{username} } @$members;
+    my $members = $self->users->names_for_ids(map { $_->{sender_id} } @out);
+    my %member_names = map { $_->{id} => $_->{username} } @$members;
 
     for my $m (@out) {
         $m->{sender_username} = $member_names{ $m->{sender_id} } // "user#$m->{sender_id}";
@@ -355,6 +356,7 @@ sub view_room ($self) {
             type        => $room->{type},
         },
         messages => \@out,
+        next_cursor => $next,
         report   => {
             id     => $open_report->{id},
             reason => $open_report->{reason},

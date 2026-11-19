@@ -40,7 +40,9 @@ nytprof.out
 /run/
 .env
 
-# --- Secure Storage (Files encrypted at rest) ---
+# --- Local config and storage ---
+/cipherbox.conf
+# Files encrypted at rest
 # Never commit user uploads or encrypted paste blobs
 /storage/library/*.bin
 /storage/pastes/*.bin

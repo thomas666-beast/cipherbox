@@ -39,15 +39,26 @@ sub find_category_by_hash_or_id ($self, $param) {
     return $self->find_category_by_hash($param);
 }
 
-sub list_categories ($self, $parent_id = undef) {
-    if (defined $parent_id) {
-        return $self->pg->db->query(
-            'SELECT * FROM library_categories WHERE parent_id = ? ORDER BY name',
-            $parent_id,
-        )->hashes->to_array;
-    }
+sub list_categories ($self, $parent_id, $limit, $offset) {
+    my ($where, @bind) = defined($parent_id) ? ('c.parent_id = ?', $parent_id) : ('c.parent_id IS NULL');
     return $self->pg->db->query(
-        'SELECT * FROM library_categories WHERE parent_id IS NULL ORDER BY name'
+        "SELECT c.*, EXISTS (SELECT 1 FROM library_categories child WHERE child.parent_id = c.id) AS has_children
+         FROM library_categories c WHERE $where ORDER BY c.name, c.id LIMIT ? OFFSET ?",
+        @bind, $limit, $offset,
+    )->hashes->to_array;
+}
+
+sub category_path ($self, $id) {
+    return $self->pg->db->query(
+        q{WITH RECURSIVE ancestors AS (
+            SELECT id, parent_id, public_hash, name, 0 AS depth, ARRAY[id] AS visited
+            FROM library_categories WHERE id = ?
+            UNION ALL
+            SELECT p.id, p.parent_id, p.public_hash, p.name, a.depth + 1, a.visited || p.id
+            FROM ancestors a JOIN library_categories p ON p.id = a.parent_id
+            WHERE NOT p.id = ANY(a.visited)
+        ) SELECT id, public_hash, name FROM ancestors ORDER BY depth DESC},
+        $id,
     )->hashes->to_array;
 }
 
@@ -97,7 +108,7 @@ sub list_items ($self, $category_id, $limit = 100, $offset = 0) {
          FROM library_items li
          JOIN users u ON u.id = li.uploaded_by
          WHERE li.category_id = ?
-         ORDER BY li.created_at DESC
+         ORDER BY li.created_at DESC, li.id DESC
          LIMIT ? OFFSET ?',
         $category_id, $limit, $offset,
     )->hashes->to_array;
@@ -148,4 +159,3 @@ sub tree ($self) {
 }
 
 1;
-

@@ -2,13 +2,14 @@ use Mojo::Base -strict;
 use Test::More;
 use lib 't/lib';
 use TestSetup;
-use Mojo::Pg;
+use Test::Mojo;
 use Cipherbox::Model::Paste;
 
-my $pg = Mojo::Pg->new('postgresql://cipherbox:cipherbox@127.0.0.1/cipherbox_test');
+my $t = Test::Mojo->new('Cipherbox');
+my $pg = $t->app->pg;
 
 # Seed the schema fixtures the model needs
-$pg->db->query('TRUNCATE pastes, messages, room_members, room_bans, rooms, users, auth_attempts RESTART IDENTITY CASCADE');
+setup_test_db($t->app);
 
 my $alice = $pg->db->query(
     "INSERT INTO users (username, password_hash) VALUES ('alice', 'x') RETURNING *"
@@ -95,5 +96,5 @@ my $expired2 = $pastes->expired_pending(60);
 is scalar(@$expired2), 1, 'one expired';
 is $expired2->[0]{id}, $file->{id}, 'correct row expired';
 
-$pg->db->query('TRUNCATE pastes, messages, room_members, room_bans, rooms, users, auth_attempts RESTART IDENTITY CASCADE');
+teardown_test_db($t->app);
 done_testing();

@@ -37,6 +37,8 @@ const myId = computed(() => {
 // ---- Reports tab ----
 const reports = ref([])
 const reportsTotal = ref(0)
+const reportsOffset = ref(0)
+const REPORTS_PAGE = 30
 const reportsError = ref('')
 const reportsLoading = ref(false)
 const selectedReport = ref(null)
@@ -161,13 +163,18 @@ function roleBadge(role) {
 
 // ---- reports ----
 
-async function loadReports() {
+async function loadReports(nextOffset = reportsOffset.value) {
   reportsLoading.value = true
   reportsError.value = ''
   try {
-    const res = await api.get('/admin/reports')
+    const res = await api.get('/admin/reports', { params: { limit: REPORTS_PAGE, offset: nextOffset } })
+    if (!res.data.reports.length && nextOffset > 0 && res.data.total <= nextOffset) {
+      await loadReports(Math.max(0, Math.floor((res.data.total - 1) / REPORTS_PAGE) * REPORTS_PAGE))
+      return
+    }
     reports.value = res.data.reports
     reportsTotal.value = res.data.total
+    reportsOffset.value = nextOffset
   } catch (e) {
     reportsError.value = e.response?.data?.error || 'Failed to load reports'
   } finally {
@@ -200,13 +207,13 @@ async function loadViewer() {
   viewerLoading.value = true
   viewerError.value = ''
   try {
-    const params = {}
+    const params = { limit: 50 }
     if (viewerBefore.value) params.before = viewerBefore.value
     const res = await api.get(`/admin/rooms/${reportDetail.value.room.public_hash}/view`, { params })
     viewerRoom.value = res.data.room
     const batch = res.data.messages || []
-    if (batch.length < 100) viewerHasMore.value = false
-    if (batch.length) viewerBefore.value = batch[0].id
+    viewerBefore.value = res.data.next_cursor
+    viewerHasMore.value = viewerBefore.value != null
     viewerMessages.value = [...batch, ...viewerMessages.value]
   } catch (e) {
     viewerError.value = e.response?.data?.error || 'Failed to load messages'
@@ -410,6 +417,14 @@ onMounted(async () => {
             </li>
           </ul>
           <EmptyState v-else title="no open reports" hint="all clear" />
+          <nav v-if="reportsTotal > REPORTS_PAGE" aria-label="Report pages"
+            class="mt-4 flex items-center justify-between text-xs text-gray-400">
+            <button type="button" :disabled="reportsOffset === 0" class="disabled:opacity-40"
+              @click="loadReports(reportsOffset - REPORTS_PAGE)">previous reports</button>
+            <span>{{ reportsOffset + 1 }}–{{ reportsOffset + reports.length }} / {{ reportsTotal }}</span>
+            <button type="button" :disabled="reportsOffset + REPORTS_PAGE >= reportsTotal" class="disabled:opacity-40"
+              @click="loadReports(reportsOffset + REPORTS_PAGE)">next reports</button>
+          </nav>
         </template>
       </div>
 

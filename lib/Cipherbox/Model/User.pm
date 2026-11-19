@@ -62,6 +62,16 @@ sub count ($self) {
     return $self->pg->db->query('SELECT count(*) FROM users')->array->[0];
 }
 
+sub names_for_ids ($self, @ids) {
+    my %seen;
+    @ids = grep { !$seen{$_}++ } @ids;
+    return [] unless @ids;
+    my $binds = join ',', ('?') x @ids;
+    return $self->pg->db->query(
+        "SELECT id, username FROM users WHERE id IN ($binds)", @ids,
+    )->hashes->to_array;
+}
+
 sub delete ($self, $id) {
     $self->pg->db->query('DELETE FROM users WHERE id = ?', $id);
     return 1;

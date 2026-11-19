@@ -12,6 +12,8 @@ $t->get_ok('/api/users?q=bob')->status_is(401);
 
 sub make_user {
     my ($name) = @_;
+    # This test seeds searchable users; rate-limit behavior has its own suite.
+    $t->app->pg->db->query("DELETE FROM auth_attempts WHERE kind = 'register'");
     $t->post_ok('/api/auth/register' => json => {
         username => $name, password => 'pw123456',
     })->status_is(200);

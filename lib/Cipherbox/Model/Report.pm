@@ -28,7 +28,7 @@ sub list_open ($self, $limit = 100, $offset = 0) {
          JOIN users ms ON ms.id = m.sender_id
          JOIN rooms rm ON rm.id = r.room_id
          WHERE r.status = ?
-         ORDER BY r.created_at DESC
+         ORDER BY r.created_at DESC, r.id DESC
          LIMIT ? OFFSET ?',
         'open', $limit, $offset,
     )->hashes->to_array;

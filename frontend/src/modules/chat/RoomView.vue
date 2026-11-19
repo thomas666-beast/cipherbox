@@ -4,7 +4,7 @@ import { useRoute, useRouter } from 'vue-router'
 import { useAuthStore } from '../../core/auth'
 import api from '../../core/api'
 import { getSocket } from '../../core/socket'
-import { encryptMessage, decryptMessage } from '../../core/crypto'
+import { encryptMessage, decryptMessage, importRoomKey } from '../../core/crypto'
 import LoadingSpinner from '../../components/LoadingSpinner.vue'
 import ErrorBanner from '../../components/ErrorBanner.vue'
 
@@ -20,7 +20,11 @@ const logEl = ref(null)
 const room = ref(null)
 const members = ref([])
 const loadingOlder = ref(false)
-const hasMore = ref(true)
+const historyCursor = ref(null)
+const hasMore = computed(() => historyCursor.value != null)
+const HISTORY_PAGE = 50
+const viewingOlderResult = ref(false)
+const historyNavigation = ref(false)
 const initialLoading = ref(true)
 const sending = ref(false)
 const typingUsers = ref({})
@@ -183,7 +187,7 @@ async function loadRoom() {
 
 async function loadKey() {
   const res = await api.get(`/rooms/${roomHash}/key`)
-  roomKey = res.data.room_key
+  roomKey = await importRoomKey(res.data.room_key)
 }
 
 async function loadMembers() {
@@ -215,8 +219,8 @@ async function decryptOne(m) {
   }
 }
 
-async function loadInitialHistory() {
-  const res = await api.get(`/rooms/${roomHash}/messages`)
+async function loadInitialHistory(before) {
+  const res = await api.get(`/rooms/${roomHash}/messages`, { params: { before, limit: HISTORY_PAGE } })
   const out = []
   for (const m of res.data.messages) {
     const d = await decryptOne(m)
@@ -227,7 +231,7 @@ async function loadInitialHistory() {
     }
   }
   messages.value = out
-  hasMore.value = out.length >= 100
+  historyCursor.value = res.data.next_cursor
 
   for (const m of out) {
     if (m.isPaste) {
@@ -262,11 +266,12 @@ async function loadInitialHistory() {
 }
 
 async function loadOlder() {
-  if (loadingOlder.value || !hasMore.value || !messages.value.length) return
+  if (loadingOlder.value || historyNavigation.value || !hasMore.value || !messages.value.length) return
   loadingOlder.value = true
   try {
-    const oldestId = messages.value[0].id
-    const res = await api.get(`/rooms/${roomHash}/messages`, { params: { before: oldestId } })
+    const res = await api.get(`/rooms/${roomHash}/messages`, {
+      params: { before: historyCursor.value, limit: HISTORY_PAGE },
+    })
     const older = []
     for (const m of res.data.messages) {
       const d = await decryptOne(m)
@@ -276,7 +281,7 @@ async function loadOlder() {
         older.push({ id: m.id, sender_id: m.sender_id, text: d.text, ts: m.ts, edit_count: m.edit_count, deleted_at: m.deleted_at })
       }
     }
-    if (older.length < 100) hasMore.value = false
+    historyCursor.value = res.data.next_cursor
     const el = logEl.value
     const prevHeight = el ? el.scrollHeight : 0
     messages.value = [...older, ...messages.value]
@@ -327,7 +332,7 @@ async function connect() {
   }))
 
   unsubs.push(socket.on('chat.recv', async (msg) => {
-    if (msg.room_id !== room.value.id) return
+    if (msg.room_id !== room.value.id || viewingOlderResult.value) return
     // GUARD: prevent duplicates
     if (messages.value.some(m => m.id === msg.message_id)) return
 
@@ -363,8 +368,10 @@ async function connect() {
           }
         }
       }
+      if (viewingOlderResult.value) return
       messages.value.push({ id: msg.message_id, sender_id: msg.sender_id, isPaste: true, paste: payload, ts: msg.ts, edit_count: 0, deleted_at: null })
     } else {
+      if (viewingOlderResult.value) return
       messages.value.push({ id: msg.message_id, sender_id: msg.sender_id, text: text || '[decrypt failed]', ts: msg.ts, edit_count: 0, deleted_at: null })
     }
     delete typingUsers.value[msg.sender_id]
@@ -673,44 +680,48 @@ async function submitReport() {
 }
 
 // --- Search ---
-const MAX_SEARCH_PAGES = 20
+const searchCursor = ref(null)
+const activeSearch = ref('')
+let searchGeneration = 0
 
-async function runSearch() {
+async function runSearch(append = false) {
   const q = searchQuery.value.trim().toLowerCase()
+  if (append && (searching.value || !searchCursor.value || q !== activeSearch.value)) return
+  const generation = ++searchGeneration
   if (!q) {
+    searching.value = false
     searchResults.value = []
     searchDone.value = false
+    searchCursor.value = null
     return
   }
+  activeSearch.value = q
   searching.value = true
   searchError.value = ''
   searchDone.value = false
-  searchResults.value = []
+  if (!append) {
+    searchResults.value = []
+    searchCursor.value = null
+  }
   try {
-    let before = null
-    let pages = 0
-    while (pages < MAX_SEARCH_PAGES) {
-      const params = before ? { before } : {}
-      const res = await api.get(`/rooms/${roomHash}/messages`, { params })
-      const batch = res.data.messages
-      if (!batch.length) break
-      for (const m of batch) {
-        const d = await decryptOne(m)
-        if (d.isPaste || d.deleted) continue
-        if (d.text && d.text.toLowerCase().includes(q)) {
-          searchResults.value.push({ id: m.id, sender_id: m.sender_id, text: d.text, ts: m.ts })
-        }
+    const { data } = await api.get(`/rooms/${roomHash}/messages`, {
+      params: { before: searchCursor.value ?? undefined, limit: HISTORY_PAGE },
+    })
+    const matches = []
+    for (const m of data.messages) {
+      const d = await decryptOne(m)
+      if (!d.isPaste && !d.deleted && d.text?.toLowerCase().includes(q)) {
+        matches.push({ id: m.id, sender_id: m.sender_id, text: d.text, ts: m.ts })
       }
-      before = batch[0].id
-      pages++
-      if (batch.length < 100) break
     }
-    searchResults.value.sort((a, b) => new Date(a.ts) - new Date(b.ts))
+    if (generation !== searchGeneration) return
+    searchResults.value = [...matches, ...searchResults.value]
+    searchCursor.value = data.next_cursor
     searchDone.value = true
   } catch (e) {
-    searchError.value = e.response?.data?.error || 'Search failed'
+    if (generation === searchGeneration) searchError.value = e.response?.data?.error || 'Search failed'
   } finally {
-    searching.value = false
+    if (generation === searchGeneration) searching.value = false
   }
 }
 
@@ -718,6 +729,9 @@ function toggleSearch() {
   showSearch.value = !showSearch.value
   if (showSearch.value) { showInvite.value = false; showMembers.value = false; showBans.value = false }
   if (!showSearch.value) {
+    ++searchGeneration
+    searching.value = false
+    searchCursor.value = null
     searchQuery.value = ''
     searchResults.value = []
     searchDone.value = false
@@ -726,8 +740,21 @@ function toggleSearch() {
 }
 
 async function jumpToMessage(id) {
-  const idx = messages.value.findIndex((m) => m.id === id)
-  if (idx === -1) await loadInitialHistory()
+  if (loadingOlder.value || searching.value || historyNavigation.value) return
+  if (!messages.value.some(m => m.id === id)) {
+    historyNavigation.value = true
+    const previousMode = viewingOlderResult.value
+    viewingOlderResult.value = true
+    try {
+      await loadInitialHistory((BigInt(id) + 1n).toString())
+    } catch (e) {
+      viewingOlderResult.value = previousMode
+      searchError.value = e.response?.data?.error || 'Failed to open message history'
+      return
+    } finally {
+      historyNavigation.value = false
+    }
+  }
   await nextTick()
   const el = document.querySelector(`[data-mid="${id}"]`)
   if (el) {
@@ -737,6 +764,21 @@ async function jumpToMessage(id) {
     highlightTimer = setTimeout(() => el.classList.remove('bg-emerald-500/20'), 2000)
   }
   showSearch.value = false
+}
+
+async function returnToLatest() {
+  if (loadingOlder.value || historyNavigation.value) return
+  historyNavigation.value = true
+  try {
+    await loadInitialHistory()
+    viewingOlderResult.value = false
+    await nextTick()
+    if (logEl.value) logEl.value.scrollTop = logEl.value.scrollHeight
+  } catch (e) {
+    error.value = e.response?.data?.error || 'Failed to load latest messages'
+  } finally {
+    historyNavigation.value = false
+  }
 }
 
 function snippet(text, q) {
@@ -983,13 +1025,18 @@ onBeforeUnmount(() => {
     </div>
 
     <div v-if="showSearch" class="px-4 sm:px-6 py-3 border-b border-gray-800 bg-gray-900">
-      <div class="text-xs text-gray-500 mb-2">// search messages (last 2,000)</div>
+      <div class="text-xs text-gray-500 mb-2">// search messages one page at a time</div>
       <div class="flex gap-2">
-        <input v-model="searchQuery" @keyup.enter="runSearch" placeholder="search query, then enter" autocomplete="off" class="flex-1 bg-gray-950 border border-gray-800 text-emerald-300 px-3 py-1.5 rounded-md text-sm focus:outline-none focus:border-emerald-500 placeholder-gray-600" />
-        <button @click="runSearch" :disabled="searching" class="px-3 py-1.5 rounded-md bg-emerald-600 hover:bg-emerald-500 text-gray-950 font-bold text-xs transition-colors disabled:bg-gray-700 disabled:text-gray-500">{{ searching ? '...' : 'search' }}</button>
+        <input v-model="searchQuery" @keyup.enter="runSearch()" placeholder="search query, then enter" autocomplete="off" class="flex-1 bg-gray-950 border border-gray-800 text-emerald-300 px-3 py-1.5 rounded-md text-sm focus:outline-none focus:border-emerald-500 placeholder-gray-600" />
+        <button @click="runSearch()" :disabled="searching" class="px-3 py-1.5 rounded-md bg-emerald-600 hover:bg-emerald-500 text-gray-950 font-bold text-xs transition-colors disabled:bg-gray-700 disabled:text-gray-500">{{ searching ? '...' : 'search' }}</button>
       </div>
       <p v-if="searchError" class="text-xs text-red-400 mt-2">{{ searchError }}</p>
-      <p v-if="searchDone && !searchResults.length && !searchError" class="text-xs text-gray-500 mt-2">no matches</p>
+      <p v-if="searchDone && !searchResults.length && !searchError" class="text-xs text-gray-500 mt-2">
+        {{ searchCursor ? 'no matches in the messages searched so far' : 'no matches' }}
+      </p>
+      <button v-if="searchCursor && searchQuery.trim().toLowerCase() === activeSearch" type="button"
+        :disabled="searching" class="mt-2 text-xs text-emerald-400 disabled:opacity-50"
+        @click="runSearch(true)">search older messages</button>
       <ul v-if="searchResults.length" class="mt-3 max-h-60 overflow-y-auto space-y-1">
         <li v-for="r in searchResults" :key="r.id" class="text-sm bg-gray-950 border border-gray-800 rounded-md px-3 py-2 cursor-pointer hover:border-emerald-500/40" @click="jumpToMessage(r.id)">
           <div class="text-[10px] text-gray-500 mb-0.5">
@@ -1051,7 +1098,12 @@ onBeforeUnmount(() => {
     <LoadingSpinner v-if="initialLoading" label="loading messages..." />
 
     <div v-else-if="!error && !needsJoin" ref="logEl" @scroll="onScroll" class="flex-1 overflow-y-auto px-4 sm:px-6 py-4 space-y-1">
+      <button v-if="viewingOlderResult" type="button" :disabled="loadingOlder || historyNavigation"
+        class="sticky top-0 z-10 rounded bg-gray-900 px-3 py-1 text-xs text-emerald-400"
+        @click="returnToLatest()">return to latest messages</button>
       <div v-if="loadingOlder" class="text-center text-xs text-gray-500 py-2">loading older messages...</div>
+      <button v-else-if="hasMore" type="button" class="block mx-auto py-2 text-xs text-emerald-400"
+        @click="loadOlder()">load older messages</button>
       <div v-else-if="!hasMore && messages.length" class="text-center text-xs text-gray-600 py-2">// start of conversation</div>
       <div v-if="!messages.length" class="text-center text-xs text-gray-600 py-8">// no messages yet</div>
 
